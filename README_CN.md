@@ -1,51 +1,76 @@
 # KinopioHub
-云原生消息传递组件，支持JavaScript、Python、C++（Arduino）
-
-
-
-## 工作原理
-
-------
-
-『编写中。。。』
-
-## 使用方法
-
-------
-
-『编写中。。。
-
-MongoDB
-
-Node 20
-
-NATS server
-
-』
-
-
-
-## 如何开发
-
-------
-
-『编写中。。。』
+云原生消息传递组件，支持JavaScript
 
 ## Roadmap
 
-------
 
-完成
-
-- 使用数据库持久化状态
 
 开发中
 
-- 网页UI
+- Server Docker 
+- 开发文档
+- Web UI
 
 计划
 
-- python
+- 故障转移
+- 就近链接
+- Python
+- C++ (Arduino\ESP32)
 
-- C++
+# Server
 
+`...Docker 开发中
+
+# Client
+
+```js
+import { client } from "./kinopio.mjs";
+let kinopio = await client({
+    clientID: "000000000000000000000000"//替换成你的
+})
+//await kinopio.connected();
+
+//发布
+kinopio.YOUR_VAR_NAME.set("Hello World");
+
+//订阅
+kinopio.YOUR_VAR_NAME.on((Msg) => {
+    console.log("Received data", Msg);
+})
+```
+
+**services**
+```js
+import { client } from "./kinopio.mjs";
+
+let endpoint=["Abc","efg"]/*
+--> Abc.efg
+通配符支持
+eg: ["Abc","*"]
+*/
+
+kinopio.serve(endpoint,
+    async (err, msg) => {
+        if (err) {
+            console.warn("[Peach] Subscribe Error:", err);
+            return;
+        }
+
+        console.log("Received data:", msg.subject, kinopio.decode(msg.data));
+        msg.respond(
+            kinopio.encode({
+                status: "ok",
+                data: {
+                    message: "Hello, Mario!"
+                }
+            })
+        );
+
+    }
+);
+
+
+const rev = await kinopio.request(endpoint,{data:"Hello,Princess!"});
+console.log("REV":rev)
+```

@@ -1,4 +1,6 @@
-
+// TODO
+// reg var
+// remote action eg exec
 import { connect, StringCodec } from "nats.ws";
 import { event, nanoid } from "skyboxtool"
 import fs from "fs/promises"
@@ -10,7 +12,7 @@ export async function client(opt) {
     let handler = {}
     const options = {
         debug: false,
-        servers: ["ws://hub.skyboooox.com:55588"],
+        servers: [],
         noEcho: true,
         noRandomize: true,
         maxReconnectAttempts: -1,
@@ -133,11 +135,23 @@ export async function client(opt) {
         }
     }
     async function connected() {
-        return new Promise((resolve, reject) => {
-            event.on("kinopio.initDone", () => {
-                resolve()
+
+
+        if (options.skipVarInit) {
+            return new Promise((resolve, reject) => {
+                event.on("kinopio.connected", () => {
+                    resolve(true)
+                })
             })
-        })
+        }else{
+            return new Promise((resolve, reject) => {
+                event.on("kinopio.initDone", () => {
+                    resolve(true)
+                })
+            })
+        }
+
+
     }
     async function regist() {
         console.log("getVar")
@@ -218,14 +232,14 @@ export async function client(opt) {
         nats.subscribe(endpoint.join("."), { callback: cb });
     }
     async function serve(endpoint = [nanoid()], cb) {
-        nats.subscribe(`${zone}.${endpoint.join(".")}`, {
+        nats.subscribe(`${options.clientID}.${endpoint.join(".")}`, {
             callback: async (err, msg) => {
                 if (err) {
-                    console.warn("[ServeRAW] Subscribe Error:", err)
+                    console.warn("[Serve] Subscribe Error:", err)
                     return
                 }
-                const data = codec.decode(msg.data);
-                if (debug) console.log("[ServeRAW] Received data:", msg.subject, data);
+                const data = JSON.parse(codec.decode(msg.data));
+                if (debug) console.log("[Serve] Received data:", msg.subject, data);
                 msg.respond(
                     JSON.stringify(
                         await cb(data)
@@ -246,13 +260,13 @@ export async function client(opt) {
             }
 
             try {
-                const m = await nats.request(`${options.zone}.${endpoint.join(".")}`, JSON.stringify({
+                const msg = await nats.request(`${options.clientID}.${endpoint.join(".")}`, JSON.stringify({
                     timeStamp: Date.now(),
                     deviceID: options.device_id,
                     clientID: options.clientID,
                     data
                 }), { timeout: 1000 });
-                const req = JSON.parse(codec.decode(m.data));
+                const req = JSON.parse(codec.decode(msg.data));
                 if (debug) console.log("[request Response]", req);
                 resolve(req);
             } catch (err) {

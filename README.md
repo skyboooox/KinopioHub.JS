@@ -26,6 +26,7 @@
 ```js
 import { client } from "./kinopio.mjs";
 let kinopio = await client({
+    servers: ["ws://server1:4222", "ws://server2:4222"],//Replace Your Server
     clientID: "000000000000000000000000"//Replace Your ID
 })
 //await kinopio.connected();
@@ -48,7 +49,11 @@ let endpoint=["Abc","efg"]/*
 Support wildcard
 eg: ["Abc","*"]
 */
-
+let kinopio = await client({
+    servers: ["ws://server1:4222", "ws://server2:4222"],//Replace Your Server
+    clientID: "000000000000000000000000"//Replace Your ID
+})
+await kinopio.connected();
 kinopio.serve_raw(endpoint,
     async (err, msg) => {
         if (err) {
@@ -71,6 +76,6 @@ kinopio.serve_raw(endpoint,
 
 
 const rev = await kinopio.request(endpoint,{data:"Hello,Princess!"});
-console.log("REV":rev)
+console.log("REV",rev)
 ```
 !@

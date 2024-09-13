@@ -1,6 +1,6 @@
 {
   "name": "kinopio-hub",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "High-Performance Communication Middleware",
   "main": "kinopio.mjs",
   "scripts": {
@@ -23,7 +23,6 @@
   },
   "homepage": "https://github.com/skyboooox/KinopioHub#readme",
   "dependencies": {
-    "mongodb": "^6.8.0",
     "nats.ws": "^1.27.0",
     "skyboxtool": "^1.0.0",
     "websocket": "^1.0.35"

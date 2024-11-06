@@ -1,0 +1,30 @@
+{
+  "name": "kinopio-hub",
+  "version": "1.0.2",
+  "description": "High-Performance Communication Middleware",
+  "main": "kinopio.mjs",
+  "scripts": {
+    "test": "node kinopio.mjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/skyboooox/KinopioHub.git"
+  },
+  "keywords": [
+    "messaging",
+    "pubsub",
+    "publish",
+    "subscribe"
+  ],
+  "author": "skyboooox",
+  "license": "GPL-3.0-or-later",
+  "bugs": {
+    "url": "https://github.com/skyboooox/KinopioHub/issues"
+  },
+  "homepage": "https://github.com/skyboooox/KinopioHub#readme",
+  "dependencies": {
+    "nats.ws": "^1.27.0",
+    "skyboxtool": "^1.0.0",
+    "websocket": "^1.0.35"
+  }
+}

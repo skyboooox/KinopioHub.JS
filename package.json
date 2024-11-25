@@ -1,6 +1,6 @@
 {
   "name": "kinopio-hub",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "High-Performance Communication Middleware",
   "main": "kinopio.mjs",
   "scripts": {

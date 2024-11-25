@@ -136,11 +136,10 @@ export async function client(opt) {
                         console.warn("[Kinopio] Subscribe Error:", err);
                         return;
                     }
-                    const data = codec.decode(msg.data);
+                    const data = JSON.parse(codec.decode(msg.data));
                     if (debug) console.log("[Kinopio] Received:", data);
-                    handler[name].value = data.value;
-                    handler[name].timestamp = data.timestamp;
-                    cb(data);
+                    //TODO: Diff
+                    cb(data.value);
                 }
             });
         };

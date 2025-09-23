@@ -1,11 +1,24 @@
 {
   "name": "kinopio-hub",
-  "version": "1.0.8",
+  "version": "2.0.0",
   "description": "High-Performance Communication Middleware",
+  "type": "module",
   "main": "kinopio.mjs",
+  "exports": {
+    ".": "./kinopio.mjs"
+  },
+  "types": "./types/index.d.ts",
+  "sideEffects": false,
+  "files": [
+    "kinopio.mjs",
+    "types",
+    "README.md",
+    "README_CN.md",
+    "LICENSE"
+  ],
   "scripts": {
-    "test": "node kinopio.mjs",
-    "publish": " npm publish --registry  https://registry.npmjs.org/"
+    "test": "node example/connection.mjs",
+    "release": "npm publish --access public"
   },
   "repository": {
     "type": "git",
@@ -19,13 +32,15 @@
   ],
   "author": "skyboooox",
   "license": "GPL-3.0-or-later",
+  "engines": {
+    "node": ">=18.17"
+  },
   "bugs": {
     "url": "https://github.com/skyboooox/KinopioHub/issues"
   },
   "homepage": "https://github.com/skyboooox/KinopioHub#readme",
   "dependencies": {
-    "nats.ws": "^1.27.0",
-    "skyboxtool": "^1.0.7",
-    "websocket": "^1.0.35"
+    "@nats-io/nats-core": "npm:@jsr/nats-io__nats-core@^3.1.0-2",
+    "skyboxtool": "^1.0.11"
   }
 }

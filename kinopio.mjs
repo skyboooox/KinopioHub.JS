@@ -54,6 +54,7 @@ export class KinopioHub {
    * @param {number} [options.reconnectTimeout=5000] - Reconnection timeout in ms
    * @param {number} [options.reconnectTimeWait=500] - Wait time between reconnects in ms
    * @param {number} [options.timeout=3000] - Operation timeout in ms
+   * @param {boolean} [options.autoConnect=true] - Start connecting immediately
    * @param {boolean} [options.autoRetry=true] - Enable automatic retry on connection failure
    * @param {number} [options.retryDelay=1000] - Initial retry delay in ms
    * @param {number} [options.maxRetryDelay=30000] - Maximum retry delay in ms
@@ -77,6 +78,7 @@ export class KinopioHub {
       maxPingOut: 3,
       timeout: 3000,
       healthReport: 5000,
+      autoConnect: true,
       autoRetry: true,
       retryDelay: 1000,
       maxRetryDelay: 30000,
@@ -98,7 +100,9 @@ export class KinopioHub {
     this.debug = this.#options.debug;
     
     // Start connection
-    this.#initConnection();
+    if (this.#options.autoConnect !== false) {
+      this.#initConnection();
+    }
     
     // Enable dynamic scope access
     return this.#createProxy();

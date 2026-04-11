@@ -1,11 +1,14 @@
 {
   "name": "kinopio-hub",
-  "version": "2.0.0",
+  "version": "2.0.3",
   "description": "High-Performance Communication Middleware",
   "type": "module",
   "main": "kinopio.mjs",
   "exports": {
-    ".": "./kinopio.mjs"
+    ".": {
+      "types": "./types/index.d.ts",
+      "default": "./kinopio.mjs"
+    }
   },
   "types": "./types/index.d.ts",
   "sideEffects": false,
@@ -17,7 +20,11 @@
     "LICENSE"
   ],
   "scripts": {
-    "test": "node example/connection.mjs",
+    "test": "bun test",
+    "test:bun": "bun test && bun run test:types && bun run test:bundle",
+    "test:types": "tsc -p test/tsconfig.json --noEmit",
+    "test:bundle": "rm -rf /tmp/kinopio-hub-browser-test && bun build ./test/browser-consumer.ts --target=browser --outdir=/tmp/kinopio-hub-browser-test",
+    "test:connection": "node example/connection.mjs",
     "release": "npm publish --access public"
   },
   "repository": {
@@ -40,7 +47,10 @@
   },
   "homepage": "https://github.com/skyboooox/KinopioHub#readme",
   "dependencies": {
-    "@nats-io/nats-core": "npm:@jsr/nats-io__nats-core@^3.1.0-2",
+    "@nats-io/nats-core": "^3.3.1",
     "skyboxtool": "^1.0.11"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3"
   }
 }

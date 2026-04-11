@@ -18,6 +18,7 @@ export interface KinopioOptions {
   maxPingOut?: number;
   timeout?: number;
   healthReport?: number;
+  autoConnect?: boolean;
   autoRetry?: boolean;
   retryDelay?: number;
   maxRetryDelay?: number;
@@ -41,6 +42,7 @@ export default class KinopioHub {
   readonly state: KinopioState;
   readonly isConnected: boolean;
 
+  connect(): Promise<void>;
   connected(timeoutMs?: number): Promise<void>;
   reconnect(): Promise<void>;
   request(subject: string, data: unknown, options?: { timeout?: number }): Promise<unknown>;
@@ -72,4 +74,3 @@ export class Variable<T = unknown> {
   serve(handler: (request: unknown, message: unknown) => unknown | Promise<unknown>, options?: { queue?: string }): Promise<Subscription>;
   dispose(): void;
 }
-

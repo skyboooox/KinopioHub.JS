@@ -115,6 +115,7 @@ await myVar.serve(async (request) => {
 | maxPingOut | number | 3 | Maximum unresponded pings before reconnect |
 | timeout | number | 3000 | Operation timeout (milliseconds) |
 | healthReport | number | 5000 | Health report interval (milliseconds) |
+| autoConnect | boolean | true | Start connecting as soon as the hub is constructed |
 | autoRetry | boolean | true | Auto retry on connection failure |
 | retryDelay | number | 1000 | Initial retry delay (ms) |
 | retryBackoffFactor | number | 1.5 | Backoff multiplier |
@@ -155,6 +156,13 @@ const stop = hub.onStateChange((state) => console.log('state:', state));
 // or using event constant
 // event.on(KINOPIO_STATE_EVENT, listener)
 stop();
+```
+
+For tests, SSR setup, or manual connection control, disable automatic connection:
+
+```javascript
+const hub = new KinopioHub({ autoConnect: false });
+await hub.connect();
 ```
 
 ### Service Mode

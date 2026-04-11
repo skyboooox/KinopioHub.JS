@@ -115,6 +115,7 @@ await myVar.serve(async (request) => {
 | maxPingOut | number | 3 | 未响应 ping 的最大次数 |
 | timeout | number | 3000 | 操作超时时间（毫秒） |
 | healthReport | number | 5000 | 健康报告间隔（毫秒） |
+| autoConnect | boolean | true | 创建 hub 后立即开始连接 |
 | autoRetry | boolean | true | 连接失败自动重试 |
 | retryDelay | number | 1000 | 初始重试延迟（毫秒） |
 | retryBackoffFactor | number | 1.5 | 退避倍数 |
@@ -155,6 +156,13 @@ const stop = hub.onStateChange((state) => console.log('state:', state));
 // 或使用事件常量
 // event.on(KINOPIO_STATE_EVENT, listener)
 stop();
+```
+
+在测试、SSR 初始化或需要手动控制连接时，可以关闭自动连接：
+
+```javascript
+const hub = new KinopioHub({ autoConnect: false });
+await hub.connect();
 ```
 
 ### 服务模式

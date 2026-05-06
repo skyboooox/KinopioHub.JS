@@ -1,6 +1,6 @@
 {
   "name": "kinopio-hub",
-  "version": "2.0.3",
+  "version": "2.1.0",
   "description": "High-Performance Communication Middleware",
   "type": "module",
   "main": "kinopio.mjs",
@@ -14,6 +14,7 @@
   "sideEffects": false,
   "files": [
     "kinopio.mjs",
+    "kinopio.d.mts",
     "types",
     "README.md",
     "README_CN.md",

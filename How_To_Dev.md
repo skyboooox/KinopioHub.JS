@@ -6,7 +6,7 @@ This document provides information and guidelines needed for contributing to Kin
 
 ### Prerequisites
 
-- Node.js >= 22.0.0
+- Node.js >= 18.17.0
 - A NATS server with WebSocket support (for testing)
 
 ### Installing Dependencies
@@ -16,4 +16,11 @@ This document provides information and guidelines needed for contributing to Kin
 git clone git@github.com:skyboooox/KinopioHub.JS.git
 cd KinopioHub.JS
 npm install
+```
+
+## Verification
+
+```bash
+npm test
+npm run test:bun
 ```

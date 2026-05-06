@@ -1,4 +1,5 @@
 export type KinopioState = "disconnected" | "connecting" | "connected" | "error";
+export type ServerSelectionMode = "ordered" | "random" | "latency";
 
 export interface KinopioCodec {
   encode(data: unknown): Uint8Array;
@@ -9,6 +10,8 @@ export interface KinopioOptions {
   debug?: boolean;
   servers?: string[];
   noEcho?: boolean;
+  serverSelectionMode?: ServerSelectionMode;
+  /** @deprecated Use serverSelectionMode instead. true maps to "ordered", false maps to "random". */
   noRandomize?: boolean;
   maxReconnectAttempts?: number;
   waitOnFirstConnect?: boolean;

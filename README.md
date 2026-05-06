@@ -52,7 +52,8 @@ The main client class for managing connections and providing access to scopes an
 
 ```javascript
 const hub = new KinopioHub({
-  servers: ["wss://nats.example.com:443"],
+  servers: ["wss://demo.nats.io:8443", "wss://demo.nats.io:4443"],
+  serverSelectionMode: "latency",
   debug: true,
   noEcho: false,
   reconnectTimeout: 5000
@@ -103,10 +104,10 @@ await myVar.serve(async (request) => {
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| servers | string[] | ["wss://demo.nats.io:8443"] | List of NATS server URLs |
+| servers | string[] | ["wss://demo.nats.io:8443", "wss://demo.nats.io:4443"] | List of NATS server URLs |
 | debug | boolean | false | Enable debug logging |
 | noEcho | boolean | false | Don't receive own published messages |
-| noRandomize | boolean | true | Don't randomize server list |
+| serverSelectionMode | "ordered" \| "random" \| "latency" | "latency" | How KinopioHub orders multiple candidate servers before connecting |
 | maxReconnectAttempts | number | -1 | Maximum reconnection attempts (-1 for infinite) |
 | waitOnFirstConnect | boolean | true | Wait for first connection |
 | reconnectTimeout | number | 5000 | Reconnection timeout (milliseconds) |
@@ -123,6 +124,36 @@ await myVar.serve(async (request) => {
 | codec | {encode(data):Uint8Array, decode(bytes):any} | undefined | Custom codec for serialization |
 | jsonReplacer | Function | undefined | JSON.stringify replacer |
 | jsonReviver | Function | undefined | JSON.parse reviver |
+
+Legacy `noRandomize` is still accepted as a compatibility alias when `serverSelectionMode` is not set, but it is no longer the primary public option.
+
+### Server Selection Modes
+
+- `ordered`: keep the input server order for the initial connect and the underlying NATS reconnect sequence.
+- `random`: reshuffle the candidate server order before each fresh connect or manual reconnect, then keep that shuffled order stable for that connection lifecycle.
+- `latency`: the default mode. Before each fresh connect or manual reconnect, KinopioHub probes every configured server in parallel, measures RTT using the NATS client's `flush()` / `rtt()` semantics, then prefers healthy servers with lower RTT. Probe failures are kept at the end in original input order, and if every probe fails the library falls back to the original input order. After a successful latency-mode connection, KinopioHub re-probes every 10 minutes and hot-switches only when another healthy server is at least 30ms faster. The switch flow rebuilds value tracking, logical subscriptions, and services on the new connection before draining the old one. During that brief dual-subscription window, regular subscribers may observe a very small number of duplicate callbacks.
+
+### Typical Mode Examples
+
+```javascript
+// Keep a fixed primary/fallback order
+const orderedHub = new KinopioHub({
+  servers: ["wss://primary.example.com:443", "wss://backup.example.com:443"],
+  serverSelectionMode: "ordered"
+});
+
+// Reshuffle candidates on each fresh connect cycle
+const randomHub = new KinopioHub({
+  servers: ["wss://a.example.com:443", "wss://b.example.com:443"],
+  serverSelectionMode: "random"
+});
+
+// Prefer the lowest-latency server and auto-migrate in the background
+const latencyHub = new KinopioHub({
+  servers: ["wss://edge-a.example.com:443", "wss://edge-b.example.com:443"],
+  serverSelectionMode: "latency"
+});
+```
 
 ## Advanced Usage
 
@@ -190,6 +221,13 @@ See the [examples directory](./example) for more detailed examples.
 ## Development
 
 See [How_To_Dev.md](./How_To_Dev.md) for development guidelines.
+
+Quick verification commands:
+
+```bash
+npm test
+npm run test:bun
+```
 
 ## License
 

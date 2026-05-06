@@ -3,6 +3,12 @@ import { event } from "skyboxtool";
 
 export const KINOPIO_STATE_EVENT = "kinopio.state";
 
+const DEFAULT_SERVERS = ["wss://demo.nats.io:8443", "wss://demo.nats.io:4443"];
+const SERVER_SELECTION_MODES = new Set(["ordered", "random", "latency"]);
+const DEFAULT_SERVER_SELECTION_MODE = "latency";
+const LATENCY_REPROBE_INTERVAL_MS = 10 * 60 * 1000;
+const LATENCY_SWITCH_THRESHOLD_MS = 30;
+
 /**
  * KinopioHub - A modern NATS client for real-time communication
  * 
@@ -32,23 +38,30 @@ export const KINOPIO_STATE_EVENT = "kinopio.state";
  */
 export class KinopioHub {
   // Core connection and state management
-  #nats = null;
+  #activeConnection = null;
+  #candidateConnection = null;
+  #activeConnectionPlan = null;
+  #pendingConnectionPlan = null;
   #options;
   #connectionPromise = null;
+  #switchLock = Promise.resolve();
   #healthCheckActive = false;
   #activeTimers = new Set();
   #scopes = new Map();
+  #variables = new Set();
   #subscriptions = new Map();
   #retryAttempt = 0;
   #currentRetryDelay = 0;
+  #latencyProbeTimer = null;
   
   /**
    * Creates a new KinopioHub instance
    * @param {Object} options - Configuration options
    * @param {boolean} [options.debug=false] - Enable debug logging
-   * @param {string[]} [options.servers=["wss://demo.nats.io:8443"]] - NATS server URLs
+   * @param {string[]} [options.servers=["wss://demo.nats.io:8443", "wss://demo.nats.io:4443"]] - NATS server URLs
    * @param {boolean} [options.noEcho=false] - Don't receive own published messages
-   * @param {boolean} [options.noRandomize=true] - Don't randomize server list
+   * @param {"ordered"|"random"|"latency"} [options.serverSelectionMode="latency"] - Strategy used to order multiple candidate servers before connecting
+   * @param {boolean} [options.noRandomize] - Deprecated compatibility alias. `true` maps to `ordered`, `false` maps to `random` when `serverSelectionMode` is unset
    * @param {number} [options.maxReconnectAttempts=-1] - Max reconnection attempts (-1 for infinite)
    * @param {boolean} [options.waitOnFirstConnect=true] - Wait for first connection
    * @param {number} [options.reconnectTimeout=5000] - Reconnection timeout in ms
@@ -67,9 +80,10 @@ export class KinopioHub {
     // Default connection options
     this.#options = {
       debug: false,
-      servers: ["wss://demo.nats.io:8443", "wss://demo.nats.io:4443"],
+      servers: [...DEFAULT_SERVERS],
       noEcho: false,
-      noRandomize: true,
+      serverSelectionMode: DEFAULT_SERVER_SELECTION_MODE,
+      noRandomize: undefined,
       maxReconnectAttempts: -1,
       waitOnFirstConnect: true,
       reconnectTimeout: 5000,
@@ -177,6 +191,30 @@ export class KinopioHub {
     this.#activeTimers.clear();
   }
 
+  #clearLatencyProbeTimer() {
+    if (!this.#latencyProbeTimer) return;
+    this.#clearTimer(this.#latencyProbeTimer);
+    this.#latencyProbeTimer = null;
+  }
+
+  #createBaseConnectOptions() {
+    const {
+      serverSelectionMode,
+      autoConnect,
+      autoRetry,
+      retryDelay,
+      maxRetryDelay,
+      retryBackoffFactor,
+      healthReport,
+      codec,
+      jsonReplacer,
+      jsonReviver,
+      ...connectOptions
+    } = this.#options;
+
+    return connectOptions;
+  }
+
   // Create proxy for dynamic property access
   #createProxy() {
     return new Proxy(this, {
@@ -196,6 +234,386 @@ export class KinopioHub {
   // Initialize NATS connection
   #initConnection() {
     this.#createTimer(() => this.connect(), 0);
+  }
+
+  #normalizeServerCandidates(servers = this.#options.servers) {
+    const inputServers = Array.isArray(servers) ? servers : [servers];
+    const candidates = inputServers
+      .filter(server => typeof server === "string")
+      .map(server => server.trim())
+      .filter(Boolean);
+
+    return candidates.length > 0 ? candidates : [...DEFAULT_SERVERS];
+  }
+
+  #resolveServerSelectionMode() {
+    const configuredMode = this.#options.serverSelectionMode;
+    if (SERVER_SELECTION_MODES.has(configuredMode)) {
+      return configuredMode;
+    }
+
+    if (typeof this.#options.noRandomize === "boolean") {
+      return this.#options.noRandomize ? "ordered" : "random";
+    }
+
+    return DEFAULT_SERVER_SELECTION_MODE;
+  }
+
+  #shuffleCandidates(candidates) {
+    const shuffled = [...candidates];
+    for (let index = shuffled.length - 1; index > 0; index--) {
+      const swapIndex = Math.floor(Math.random() * (index + 1));
+      [shuffled[index], shuffled[swapIndex]] = [shuffled[swapIndex], shuffled[index]];
+    }
+    return shuffled;
+  }
+
+  #orderConnectionCandidates(candidates, mode) {
+    if (candidates.length <= 1) {
+      return [...candidates];
+    }
+
+    switch (mode) {
+      case "random":
+        return this.#shuffleCandidates(candidates);
+      case "ordered":
+      case "latency":
+      default:
+        return [...candidates];
+    }
+  }
+
+  async #probeServerLatency(server, index) {
+    let connection = null;
+
+    try {
+      connection = await wsconnect({
+        ...this.#createBaseConnectOptions(),
+        servers: [server],
+        noRandomize: true,
+        reconnect: false,
+        maxReconnectAttempts: 0,
+        waitOnFirstConnect: false,
+      });
+
+      // Prime the connection with an explicit flush, then record a dedicated
+      // PING/PONG-based RTT from the official client helper.
+      await connection.flush();
+      const rtt = await connection.rtt();
+      if (!Number.isFinite(rtt)) {
+        throw new Error(`Invalid RTT result for ${server}`);
+      }
+
+      return {
+        server,
+        index,
+        healthy: true,
+        rtt,
+        error: null,
+      };
+    } catch (error) {
+      return {
+        server,
+        index,
+        healthy: false,
+        rtt: Number.POSITIVE_INFINITY,
+        error,
+      };
+    } finally {
+      await this.#closeConnection(connection, `latency probe for ${server}`);
+    }
+  }
+
+  async #probeLatencyCandidates(candidates) {
+    const probeResults = await Promise.all(
+      candidates.map((server, index) => this.#probeServerLatency(server, index)),
+    );
+
+    const healthyResults = probeResults
+      .filter(result => result.healthy)
+      .sort((left, right) => left.rtt - right.rtt || left.index - right.index);
+    const failedResults = probeResults
+      .filter(result => !result.healthy)
+      .sort((left, right) => left.index - right.index);
+    const allFailed = healthyResults.length === 0;
+
+    return {
+      allFailed,
+      probeResults,
+      orderedCandidates: allFailed
+        ? [...candidates]
+        : [...healthyResults, ...failedResults].map(result => result.server),
+    };
+  }
+
+  async #createConnectionPlan() {
+    const sourceCandidates = this.#normalizeServerCandidates();
+    const mode = this.#resolveServerSelectionMode();
+    let orderedCandidates = this.#orderConnectionCandidates(sourceCandidates, mode);
+    let probeResults = [];
+    let latencyProbePending = mode === "latency" && orderedCandidates.length > 1;
+    let latencyProbeFailedAll = false;
+
+    if (latencyProbePending) {
+      const probeSummary = await this.#probeLatencyCandidates(sourceCandidates);
+      orderedCandidates = probeSummary.orderedCandidates;
+      probeResults = probeSummary.probeResults;
+      latencyProbeFailedAll = probeSummary.allFailed;
+      latencyProbePending = false;
+
+      if (latencyProbeFailedAll) {
+        this.#log(
+          "warn",
+          "Latency probe failed for every configured server, falling back to the original candidate order",
+          sourceCandidates,
+        );
+      } else {
+        this.#log(
+          "info",
+          "Latency probe ordered candidate servers",
+          probeResults.map(result => ({
+            server: result.server,
+            healthy: result.healthy,
+            rtt: result.healthy ? result.rtt : null,
+          })),
+        );
+      }
+    }
+
+    return {
+      mode,
+      sourceCandidates,
+      orderedCandidates,
+      createdAt: Date.now(),
+      latencyProbePending,
+      latencyProbeFailedAll,
+      probeResults,
+    };
+  }
+
+  #createConnectOptions(connectionPlan) {
+    return {
+      ...this.#createBaseConnectOptions(),
+      servers: connectionPlan.orderedCandidates,
+      // We control candidate order in the library, so the underlying client
+      // should preserve it for both the initial connect and later reconnects.
+      noRandomize: true,
+    };
+  }
+
+  #runWithSwitchLock(task) {
+    const run = this.#switchLock.then(task, task);
+    this.#switchLock = run.then(() => undefined, () => undefined);
+    return run;
+  }
+
+  async #setCandidateConnection(connection, connectionPlan) {
+    await this.#runWithSwitchLock(async () => {
+      this.#candidateConnection = connection;
+      this.#pendingConnectionPlan = connectionPlan;
+    });
+  }
+
+  async #promoteCandidateConnection(connection, connectionPlan) {
+    await this.#runWithSwitchLock(async () => {
+      this.#activeConnection = connection;
+      this.#activeConnectionPlan = connectionPlan;
+      this.#candidateConnection = null;
+      this.#pendingConnectionPlan = null;
+    });
+  }
+
+  async #closeConnection(connection, label) {
+    if (!connection) return;
+
+    try {
+      await connection.drain();
+    } catch (error) {
+      this.#log("warn", `Drain failed for ${label}:`, error);
+      try {
+        await connection.close();
+      } catch (closeError) {
+        this.#log("warn", `Close failed for ${label}:`, closeError);
+      }
+    }
+  }
+
+  async #discardCandidateConnection(connection) {
+    if (!connection) return;
+
+    await this.#runWithSwitchLock(async () => {
+      if (this.#candidateConnection === connection) {
+        this.#candidateConnection = null;
+        this.#pendingConnectionPlan = null;
+      }
+    });
+
+    await this.#closeConnection(connection, "candidate connection");
+  }
+
+  #supportsLatencyMonitoring(connectionPlan = this.#activeConnectionPlan) {
+    return connectionPlan?.mode === "latency" && connectionPlan?.sourceCandidates?.length > 1;
+  }
+
+  #scheduleLatencyProbeCycle() {
+    this.#clearLatencyProbeTimer();
+
+    if (!this.#supportsLatencyMonitoring() || !this.#activeConnection) {
+      return;
+    }
+
+    this.#latencyProbeTimer = this.#createTimer(() => {
+      this.#latencyProbeTimer = null;
+      this.#runLatencyProbeCycle().catch(error => {
+        this.#log("error", "Latency re-probe cycle failed:", error);
+      });
+    }, LATENCY_REPROBE_INTERVAL_MS);
+  }
+
+  async #runLatencyProbeCycle() {
+    try {
+      await this.#maybeHotSwitchLatencyConnection();
+    } finally {
+      if (this.#activeConnection && this.#supportsLatencyMonitoring()) {
+        this.#scheduleLatencyProbeCycle();
+      }
+    }
+  }
+
+  async #rebuildRegisteredState(connection) {
+    for (const variable of this.#variables) {
+      await variable.rebindToConnection(connection);
+    }
+  }
+
+  async #maybeHotSwitchLatencyConnection() {
+    const currentPlan = this.#activeConnectionPlan;
+
+    if (!this.#activeConnection || this.state !== "connected" || !this.#supportsLatencyMonitoring(currentPlan)) {
+      return false;
+    }
+
+    const probeSummary = await this.#probeLatencyCandidates(currentPlan.sourceCandidates);
+    if (probeSummary.allFailed) {
+      this.#log("warn", "Background latency re-probe failed for every configured server; keeping the current connection");
+      return false;
+    }
+
+    const healthyResults = probeSummary.probeResults
+      .filter(result => result.healthy)
+      .sort((left, right) => left.rtt - right.rtt || left.index - right.index);
+    const bestHealthy = healthyResults[0];
+    const currentServer = this.#activeConnection.getServer?.() ?? currentPlan.connectedServer ?? currentPlan.orderedCandidates[0];
+    const currentHealthy = healthyResults.find(result => result.server === currentServer) ?? null;
+
+    if (!bestHealthy || bestHealthy.server === currentServer) {
+      this.#log("debug", "Background latency re-probe kept the current active server", {
+        currentServer,
+        bestServer: bestHealthy?.server ?? null,
+      });
+      return false;
+    }
+
+    if (currentHealthy && currentHealthy.rtt - bestHealthy.rtt < LATENCY_SWITCH_THRESHOLD_MS) {
+      this.#log("info", "Background latency re-probe found a faster server but it did not beat the switch threshold", {
+        currentServer,
+        currentRtt: currentHealthy.rtt,
+        bestServer: bestHealthy.server,
+        bestRtt: bestHealthy.rtt,
+        thresholdMs: LATENCY_SWITCH_THRESHOLD_MS,
+      });
+      return false;
+    }
+
+    const nextPlan = {
+      ...currentPlan,
+      createdAt: Date.now(),
+      orderedCandidates: probeSummary.orderedCandidates,
+      probeResults: probeSummary.probeResults,
+      latencyProbePending: false,
+      latencyProbeFailedAll: false,
+    };
+
+    this.#log("info", "Hot switching to a lower-latency server", {
+      from: currentServer,
+      to: bestHealthy.server,
+      currentRtt: currentHealthy?.rtt ?? null,
+      nextRtt: bestHealthy.rtt,
+      thresholdMs: LATENCY_SWITCH_THRESHOLD_MS,
+    });
+
+    await this.#switchActiveConnection(nextPlan);
+    return true;
+  }
+
+  async #openConnection(connectionPlan, label = "connection") {
+    let timeoutId = null;
+    let connectionTimedOut = false;
+    let connection = null;
+
+    try {
+      const connectOptions = this.#createConnectOptions(connectionPlan);
+      const connectPromise = wsconnect(connectOptions).then(async (nextConnection) => {
+        if (connectionTimedOut) {
+          await this.#closeConnection(nextConnection, `${label} after timeout`);
+          return null;
+        }
+        return nextConnection;
+      });
+      const timeoutPromise = new Promise((_, reject) => {
+        timeoutId = this.#createTimer(() => {
+          connectionTimedOut = true;
+          reject(new Error("NATS connection timeout"));
+        }, this.#options.timeout || 10000);
+      });
+
+      connection = await Promise.race([connectPromise, timeoutPromise]);
+      if (!connection) {
+        throw new Error("NATS connection timeout");
+      }
+
+      return connection;
+    } finally {
+      if (timeoutId) this.#clearTimer(timeoutId);
+    }
+  }
+
+  async #switchActiveConnection(connectionPlan) {
+    const previousConnection = this.#activeConnection;
+    let candidateConnection = null;
+
+    try {
+      candidateConnection = await this.#openConnection(connectionPlan, "candidate connection");
+      await this.#setCandidateConnection(candidateConnection, connectionPlan);
+      await this.#verifyConnection(candidateConnection);
+      await this.#rebuildRegisteredState(candidateConnection);
+      await candidateConnection.flush();
+
+      connectionPlan.connectedServer = candidateConnection.getServer?.() ?? connectionPlan.orderedCandidates[0];
+
+      await this.#promoteCandidateConnection(candidateConnection, connectionPlan);
+      this.#startHealthCheck(candidateConnection);
+      this.#scheduleLatencyProbeCycle();
+
+      if (previousConnection && previousConnection !== candidateConnection) {
+        await this.#closeConnection(previousConnection, "previous active connection after hot switch");
+      }
+
+      return candidateConnection;
+    } catch (error) {
+      if (candidateConnection) {
+        await this.#discardCandidateConnection(candidateConnection);
+      }
+      throw error;
+    }
+  }
+
+  registerVariable(variable) {
+    this.#variables.add(variable);
+  }
+
+  unregisterVariable(variable) {
+    this.#variables.delete(variable);
   }
 
   // Log messages with timestamp
@@ -285,25 +703,26 @@ export class KinopioHub {
     await this.#setState("connecting");
     
     while (true) {
-      let timeoutId = null;
+      let connectionPlan = null;
+      let candidateConnection = null;
       
       try {
         this.#retryAttempt++;
-        this.#log("info", `Connecting to NATS (attempt ${this.#retryAttempt})`, this.#options.servers);
-        
-        const connectPromise = wsconnect(this.#options);
-        const timeoutPromise = new Promise((_, reject) => {
-          timeoutId = this.#createTimer(() => {
-            reject(new Error("NATS connection timeout"));
-          }, this.#options.timeout || 10000);
-        });
-        
-        this.#nats = await Promise.race([connectPromise, timeoutPromise]);
-        
-        if (timeoutId) this.#clearTimer(timeoutId);
-        
-        await this.#verifyConnection();
-        this.#startHealthCheck();
+        connectionPlan = await this.#createConnectionPlan();
+        this.#log(
+          "info",
+          `Connecting to NATS (attempt ${this.#retryAttempt}) using ${connectionPlan.mode} mode`,
+          connectionPlan.orderedCandidates,
+        );
+        candidateConnection = await this.#openConnection(connectionPlan, "initial connection");
+        await this.#setCandidateConnection(candidateConnection, connectionPlan);
+        await this.#verifyConnection(candidateConnection);
+        await this.#rebuildRegisteredState(candidateConnection);
+        await candidateConnection.flush();
+        connectionPlan.connectedServer = candidateConnection.getServer?.() ?? connectionPlan.orderedCandidates[0];
+        await this.#promoteCandidateConnection(candidateConnection, connectionPlan);
+        this.#startHealthCheck(candidateConnection);
+        this.#scheduleLatencyProbeCycle();
         await this.#setState("connected");
         
         // Reset retry state on successful connection
@@ -314,7 +733,9 @@ export class KinopioHub {
         return;
         
       } catch (error) {
-        if (timeoutId) this.#clearTimer(timeoutId);
+        if (candidateConnection) {
+          await this.#discardCandidateConnection(candidateConnection);
+        }
         
         this.#log("error", `Connection attempt ${this.#retryAttempt} failed:`, error.message);
         
@@ -348,11 +769,11 @@ export class KinopioHub {
   }
 
   // Verify connection is working
-  async #verifyConnection() {
-    if (!this.#nats) throw new Error("No NATS connection");
+  async #verifyConnection(connection = this.#activeConnection) {
+    if (!connection) throw new Error("No NATS connection");
     
     try {
-      this.#nats.publish("_test.connection", new Uint8Array(0));
+      connection.publish("_test.connection", new Uint8Array(0));
       this.#log("debug", "Connection verified");
     } catch (error) {
       this.#log("error", "Verification failed", error);
@@ -461,40 +882,40 @@ export class KinopioHub {
   // Clean up resources
   async #cleanup() {
     this.#healthCheckActive = false;
+    this.#clearLatencyProbeTimer();
     this.#clearAllTimers();
-    
-    if (this.#nats) {
-      try {
-        await this.#nats.drain();
-      } catch (error) {
-        this.#log("warn", "Drain failed during cleanup:", error);
-        try {
-          await this.#nats.close();
-        } catch (closeError) {
-          this.#log("warn", "Close failed during cleanup:", closeError);
-        }
-      }
-      this.#nats = null;
+
+    const activeConnection = this.#activeConnection;
+    const candidateConnection = this.#candidateConnection;
+
+    this.#activeConnection = null;
+    this.#candidateConnection = null;
+    this.#activeConnectionPlan = null;
+    this.#pendingConnectionPlan = null;
+
+    await this.#closeConnection(candidateConnection, "candidate connection during cleanup");
+    if (activeConnection && activeConnection !== candidateConnection) {
+      await this.#closeConnection(activeConnection, "active connection during cleanup");
     }
     
     await this.#setState("disconnected");
   }
 
   // Start health monitoring
-  #startHealthCheck() {
-    if (this.#healthCheckActive) return;
+  #startHealthCheck(connection = this.#activeConnection) {
+    if (!connection) return;
     this.#healthCheckActive = true;
     
-    this.#runHealthCheck().catch(error => {
+    this.#runHealthCheck(connection).catch(error => {
       this.#log("error", "Health check failed:", error);
     });
   }
 
   // Monitor connection health
-  async #runHealthCheck() {
+  async #runHealthCheck(connection) {
     try {
-      for await (const status of this.#nats.status()) {
-        if (!this.#healthCheckActive) break;
+      for await (const status of connection.status()) {
+        if (!this.#healthCheckActive || connection !== this.#activeConnection) break;
         
         const stateMap = {
           reconnect: "connected",
@@ -508,7 +929,7 @@ export class KinopioHub {
         }
       }
     } catch (error) {
-      if (this.#healthCheckActive) {
+      if (this.#healthCheckActive && connection === this.#activeConnection) {
         this.#log("error", "Health check error:", error);
         await this.#setState("error");
       }
@@ -533,7 +954,7 @@ export class KinopioHub {
       const message = this.#serializeData(data);
       this.#log("debug", `Sending request to ${subject}`, { data, timeout });
       
-      const response = await this.#nats.request(subject, message, { timeout });
+      const response = await this.#activeConnection.request(subject, message, { timeout });
       const responseData = this.#deserializeData(response.data);
       
       this.#log("debug", `Received response from ${subject}`, responseData);
@@ -605,7 +1026,7 @@ export class KinopioHub {
   }
 
   // Public getters for internal state
-  get nats() { return this.#nats; }
+  get nats() { return this.#activeConnection; }
   get subscriptions() { return this.#subscriptions; }
   get healthCheckActive() { return this.#healthCheckActive; }
   
@@ -739,6 +1160,7 @@ class Scope {
     return this.#variables.get(varName) ?? (() => {
       const variable = new Variable(this.#hub, this.#scopeName, varName);
       this.#variables.set(varName, variable);
+      this.#hub.registerVariable(variable);
       return variable;
     })();
   }
@@ -748,9 +1170,89 @@ class Scope {
    */
   dispose() {
     for (const [, variable] of this.#variables) {
+      this.#hub.unregisterVariable(variable);
       variable.dispose();
     }
     this.#variables.clear();
+  }
+}
+
+class ManagedSubscriptionHandle {
+  #active = true;
+  #subscription = null;
+  #iteratorEnabled = false;
+  #iteratorQueue = [];
+  #iteratorWaiters = [];
+  #onUnsubscribe;
+
+  constructor(onUnsubscribe = null) {
+    this.#onUnsubscribe = onUnsubscribe;
+  }
+
+  get active() {
+    return this.#active;
+  }
+
+  bind(subscription) {
+    this.#subscription = subscription;
+    return subscription;
+  }
+
+  notify(message) {
+    if (!this.#active || !this.#iteratorEnabled) return;
+
+    const waiter = this.#iteratorWaiters.shift();
+    if (waiter) {
+      waiter({ value: message, done: false });
+      return;
+    }
+
+    this.#iteratorQueue.push(message);
+  }
+
+  unsubscribe() {
+    if (!this.#active) return;
+
+    this.#active = false;
+
+    try {
+      this.#subscription?.unsubscribe?.();
+    } finally {
+      this.#subscription = null;
+      this.#iteratorQueue.length = 0;
+      while (this.#iteratorWaiters.length > 0) {
+        const waiter = this.#iteratorWaiters.shift();
+        waiter?.({ value: undefined, done: true });
+      }
+      this.#onUnsubscribe?.();
+    }
+  }
+
+  [Symbol.asyncIterator]() {
+    this.#iteratorEnabled = true;
+
+    return {
+      next: () => {
+        if (this.#iteratorQueue.length > 0) {
+          return Promise.resolve({ value: this.#iteratorQueue.shift(), done: false });
+        }
+
+        if (!this.#active) {
+          return Promise.resolve({ value: undefined, done: true });
+        }
+
+        return new Promise(resolve => {
+          this.#iteratorWaiters.push(resolve);
+        });
+      },
+      return: async () => {
+        this.unsubscribe();
+        return { value: undefined, done: true };
+      },
+      [Symbol.asyncIterator]() {
+        return this;
+      },
+    };
   }
 }
 
@@ -793,12 +1295,14 @@ class Variable {
   #varName;
   #subject;
   #lastPublishedMessage = null;
-  #subscriptionCache = new Map();
+  #subscriptionDefinitions = new Map();
   #latestValue = null;
   #valueSubscription = null;
+  #valueTrackingConnection = null;
+  #valueTrackingRetryTimer = null;
   #hasReceivedValue = false;
-  #serviceSubscription = null;
-  #serviceHandler = null;
+  #serviceDefinition = null;
+  #disposed = false;
   
   /**
    * Creates a new Variable instance
@@ -814,7 +1318,7 @@ class Variable {
     
     this.#startValueTracking();
     
-    // ES2024: Enhanced proxy with readonly value property
+    // ES2024: Enhanced proxy with virtual readonly properties
     return new Proxy(this, {
       get: (target, prop) => {
         if (prop === 'value') {
@@ -835,33 +1339,68 @@ class Variable {
           target.#hub.log("warn", `Cannot set readonly property 'value' on Variable ${target.#subject}`);
           return true;
         }
+        if (prop === 'subject') {
+          target.#hub.log("warn", `Cannot set readonly property 'subject' on Variable ${target.#subject}`);
+          return true;
+        }
         target[prop] = value;
         return true;
       }
     });
   }
 
-  // Track variable value changes with retry
+  get subject() {
+    return this.#subject;
+  }
+
+  #clearValueTrackingRetry() {
+    if (!this.#valueTrackingRetryTimer) return;
+    clearTimeout(this.#valueTrackingRetryTimer);
+    this.#valueTrackingRetryTimer = null;
+  }
+
+  #scheduleValueTrackingRetry(delayMs) {
+    if (this.#disposed || this.#valueTrackingRetryTimer) return;
+
+    this.#valueTrackingRetryTimer = setTimeout(() => {
+      this.#valueTrackingRetryTimer = null;
+      this.#startValueTracking().catch(error => {
+        this.#hub.log("debug", `Value tracking retry failed for ${this.#subject}:`, error.message);
+      });
+    }, delayMs);
+  }
+
   async #startValueTracking() {
+    if (this.#disposed || this.#valueSubscription) return;
+
     try {
       await this.#hub.connected();
-      
+
       if (!this.#hub.nats) {
         this.#hub.log("debug", `NATS connection not available for ${this.#subject}, waiting...`);
-        setTimeout(() => this.#startValueTracking(), 1000);
+        this.#scheduleValueTrackingRetry(1000);
         return;
       }
-      
-      const subscription = this.#hub.nats.subscribe(this.#subject, { max: -1 });
-      this.#valueSubscription = subscription;
-      
-      this.#processValueMessages(subscription);
+
+      await this.#rebindValueTracking(this.#hub.nats);
       this.#hub.log("debug", `Value tracking started: ${this.#subject}`);
     } catch (error) {
+      if (this.#disposed) return;
       this.#hub.log("debug", `Value tracking failed: ${this.#subject}, will retry...`, error.message);
-      // Retry after delay on error
-      setTimeout(() => this.#startValueTracking(), 2000);
+      this.#scheduleValueTrackingRetry(2000);
     }
+  }
+
+  async #rebindValueTracking(connection) {
+    if (this.#disposed || !connection) return;
+    if (this.#valueTrackingConnection === connection && this.#valueSubscription) return;
+
+    const subscription = connection.subscribe(this.#subject, { max: -1 });
+    this.#valueSubscription = subscription;
+    this.#valueTrackingConnection = connection;
+    this.#clearValueTrackingRetry();
+
+    this.#processValueMessages(subscription);
   }
 
   // Ensure NATS connection is available
@@ -888,6 +1427,8 @@ class Variable {
   async #processValueMessages(subscription) {
     try {
       for await (const message of subscription) {
+        if (this.#disposed) break;
+
         try {
           const data = this.#deserializeData(message.data);
           this.#latestValue = data;
@@ -898,9 +1439,40 @@ class Variable {
         }
       }
     } catch (error) {
-      if (this.#hub.healthCheckActive) {
+      if (!this.#disposed && this.#hub.healthCheckActive) {
         this.#hub.log("error", `Value tracking iterator error for ${this.#subject}:`, error);
       }
+    }
+  }
+
+  async #subscribeDefinitionToConnection(definition, connection) {
+    const subscription = connection.subscribe(this.#subject, definition.options);
+    definition.currentSubscription = subscription;
+    definition.handle.bind(subscription);
+    this.#processMessages(subscription, definition);
+    return subscription;
+  }
+
+  async #subscribeServiceDefinitionToConnection(definition, connection) {
+    const subscription = connection.subscribe(this.#subject, definition.options);
+    definition.currentSubscription = subscription;
+    definition.handle.bind(subscription);
+    this.#processServiceRequests(subscription, definition, connection);
+    return subscription;
+  }
+
+  async rebindToConnection(connection) {
+    if (this.#disposed || !connection) return;
+
+    await this.#rebindValueTracking(connection);
+
+    for (const definition of this.#subscriptionDefinitions.values()) {
+      if (!definition.handle.active) continue;
+      await this.#subscribeDefinitionToConnection(definition, connection);
+    }
+
+    if (this.#serviceDefinition?.handle.active) {
+      await this.#subscribeServiceDefinitionToConnection(this.#serviceDefinition, connection);
     }
   }
 
@@ -949,45 +1521,50 @@ class Variable {
     
     const subKey = this.#generateSubscriptionKey(options);
     
-    const existing = this.#subscriptionCache.get(subKey);
+    const existing = this.#subscriptionDefinitions.get(subKey);
     if (existing) {
       this.#hub.log("debug", `Reusing sub: ${this.#subject}`);
-      return existing;
+      return existing.handle;
     }
 
     try {
-      const subscription = this.#hub.nats.subscribe(this.#subject, options);
-      const originalUnsubscribe = subscription.unsubscribe?.bind(subscription);
-      // wrap unsubscribe to cleanup caches
-      subscription.unsubscribe = () => {
-        try { originalUnsubscribe?.(); } finally {
-          this.#subscriptionCache.delete(subKey);
-          this.#hub.subscriptions.delete(`${this.#subject}_${subKey}`);
-        }
+      const handle = new ManagedSubscriptionHandle(() => {
+        this.#subscriptionDefinitions.delete(subKey);
+        this.#hub.subscriptions.delete(`${this.#subject}_${subKey}`);
+      });
+      const definition = {
+        key: subKey,
+        callback,
+        options,
+        handle,
+        currentSubscription: null,
       };
-      
-      this.#subscriptionCache.set(subKey, subscription);
-      this.#hub.subscriptions.set(`${this.#subject}_${subKey}`, subscription);
-      
-      this.#processMessages(subscription, callback);
+
+      this.#subscriptionDefinitions.set(subKey, definition);
+      this.#hub.subscriptions.set(`${this.#subject}_${subKey}`, handle);
+      await this.#subscribeDefinitionToConnection(definition, this.#hub.nats);
       
       this.#hub.log("debug", `Subscribed: ${this.#subject}`, options);
-      return subscription;
+      return handle;
       
     } catch (error) {
+      this.#subscriptionDefinitions.get(subKey)?.handle.unsubscribe();
       this.#hub.log("error", `Sub failed: ${this.#subject}`, error);
       throw error;
     }
   }
 
   // Process subscription messages
-  async #processMessages(subscription, callback) {
+  async #processMessages(subscription, definition) {
     try {
       for await (const message of subscription) {
+        if (this.#disposed || !definition.handle.active) continue;
+
         // ES2024: Use structured error handling
         const processMessage = async () => {
           const data = this.#deserializeData(message.data);
-          await callback(data, message);
+          definition.handle.notify(message);
+          await definition.callback(data, message);
         };
         
         await processMessage().catch(error => 
@@ -995,7 +1572,7 @@ class Variable {
         );
       }
     } catch (error) {
-      if (this.#hub.healthCheckActive) {
+      if (!this.#disposed && this.#hub.healthCheckActive && definition.handle.active) {
         this.#hub.log("error", `Iterator error: ${this.#subject}`, error);
       }
     }
@@ -1038,55 +1615,63 @@ class Variable {
   async serve(handler, options = {}) {
     await this.#ensureNatsConnection("service");
     
-    if (this.#serviceSubscription) {
+    if (this.#serviceDefinition) {
       this.#hub.log("debug", `Stopping service: ${this.#subject}`);
       try {
-        this.#serviceSubscription.unsubscribe();
-        this.#hub.subscriptions.delete(`${this.#subject}_service`);
+        this.#serviceDefinition.handle.unsubscribe();
       } catch (error) {
         this.#hub.log("warn", `Failed to stop existing service:`, error);
       }
     }
     
     try {
-      this.#serviceHandler = handler;
-      
-      const subscribeOptions = {
+      const normalizedOptions = {
         ...options,
         queue: options.queue || `${this.#subject}.service`
       };
-      
-      this.#serviceSubscription = this.#hub.nats.subscribe(this.#subject, subscribeOptions);
-      const originalUnsubscribe = this.#serviceSubscription.unsubscribe?.bind(this.#serviceSubscription);
-      this.#serviceSubscription.unsubscribe = () => {
-        try { originalUnsubscribe?.(); } finally {
+
+      const handle = new ManagedSubscriptionHandle(() => {
+        if (this.#serviceDefinition?.handle === handle) {
+          this.#serviceDefinition = null;
           this.#hub.subscriptions.delete(`${this.#subject}_service`);
         }
+      });
+      const definition = {
+        handler,
+        options: normalizedOptions,
+        handle,
+        currentSubscription: null,
       };
-      this.#hub.subscriptions.set(`${this.#subject}_service`, this.#serviceSubscription);
+
+      this.#serviceDefinition = definition;
+      this.#hub.subscriptions.set(`${this.#subject}_service`, handle);
+      await this.#subscribeServiceDefinitionToConnection(definition, this.#hub.nats);
       
-      this.#processServiceRequests(this.#serviceSubscription, handler);
-      
-      this.#hub.log("debug", `Service started: ${this.#subject}`, subscribeOptions);
-      return this.#serviceSubscription;
+      this.#hub.log("debug", `Service started: ${this.#subject}`, normalizedOptions);
+      return handle;
       
     } catch (error) {
+      if (this.#serviceDefinition) {
+        this.#serviceDefinition.handle.unsubscribe();
+      }
       this.#hub.log("error", `Service failed: ${this.#subject}`, error);
       throw error;
     }
   }
 
   // Process incoming service requests
-  async #processServiceRequests(subscription, handler) {
+  async #processServiceRequests(subscription, definition, connection) {
     try {
       for await (const message of subscription) {
+        if (this.#disposed || !definition.handle.active) continue;
+
         try {
           const requestData = this.#deserializeData(message.data);
           this.#hub.log("debug", `Received service request for ${this.#subject}:`, requestData);
           
           let responseData;
           try {
-            responseData = await handler(requestData, message);
+            responseData = await definition.handler(requestData, message);
           } catch (handlerError) {
             this.#hub.log("error", `Handler error: ${this.#subject}`, handlerError);
             responseData = { 
@@ -1097,7 +1682,7 @@ class Variable {
           
           if (message.reply) {
             const responseMessage = this.#serializeData(responseData);
-            this.#hub.nats.publish(message.reply, responseMessage);
+            connection.publish(message.reply, responseMessage);
             this.#hub.log("debug", `Sent service response for ${this.#subject}:`, responseData);
           }
           
@@ -1106,7 +1691,7 @@ class Variable {
         }
       }
     } catch (error) {
-      if (this.#hub.healthCheckActive) {
+      if (!this.#disposed && this.#hub.healthCheckActive && definition.handle.active) {
         this.#hub.log("error", `Service error: ${this.#subject}`, error);
       }
     }
@@ -1142,32 +1727,36 @@ class Variable {
    * Cleans up subscriptions and resources
    */
   dispose() {
-    [this.#valueSubscription, this.#serviceSubscription]
-      .filter(Boolean)
-      .forEach(sub => {
-        try {
-          sub.unsubscribe();
-        } catch (error) {
-          this.#hub.log("warn", "Cleanup failed", error);
-        }
-      });
-    
-    if (this.#serviceSubscription) {
-      this.#hub.subscriptions.delete(`${this.#subject}_service`);
-      this.#serviceSubscription = null;
-      this.#serviceHandler = null;
-    }
-    
-    for (const [key, subscription] of this.#subscriptionCache) {
+    this.#disposed = true;
+    this.#clearValueTrackingRetry();
+
+    for (const subscription of [this.#valueSubscription]) {
+      if (!subscription) continue;
       try {
         subscription.unsubscribe();
-        this.#hub.subscriptions.delete(`${this.#subject}_${key}`);
+      } catch (error) {
+        this.#hub.log("warn", "Cleanup failed", error);
+      }
+    }
+
+    if (this.#serviceDefinition) {
+      try {
+        this.#serviceDefinition.handle.unsubscribe();
+      } catch (error) {
+        this.#hub.log("warn", `Cleanup failed: ${this.#subject}_service`, error);
+      }
+      this.#serviceDefinition = null;
+    }
+
+    for (const [key, definition] of this.#subscriptionDefinitions) {
+      try {
+        definition.handle.unsubscribe();
       } catch (error) {
         this.#hub.log("warn", `Cleanup failed: ${key}`, error);
       }
     }
-    
-    this.#subscriptionCache.clear();
+
+    this.#subscriptionDefinitions.clear();
     this.#resetState();
   }
 
@@ -1177,6 +1766,7 @@ class Variable {
     this.#latestValue = null;
     this.#hasReceivedValue = false;
     this.#valueSubscription = null;
+    this.#valueTrackingConnection = null;
   }
 }
 

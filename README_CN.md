@@ -52,7 +52,8 @@ await myVar.sub(data => {
 
 ```javascript
 const hub = new KinopioHub({
-  servers: ["wss://nats.example.com:443"],
+  servers: ["wss://demo.nats.io:8443", "wss://demo.nats.io:4443"],
+  serverSelectionMode: "latency",
   debug: true,
   noEcho: false,
   reconnectTimeout: 5000
@@ -103,10 +104,10 @@ await myVar.serve(async (request) => {
 
 | 选项 | 类型 | 默认值 | 描述 |
 |--------|------|---------|-------------|
-| servers | string[] | ["wss://demo.nats.io:8443"] | NATS服务器URL列表 |
+| servers | string[] | ["wss://demo.nats.io:8443", "wss://demo.nats.io:4443"] | NATS服务器URL列表 |
 | debug | boolean | false | 启用调试日志 |
 | noEcho | boolean | false | 不接收自己发布的消息 |
-| noRandomize | boolean | true | 不随机化服务器列表 |
+| serverSelectionMode | "ordered" \| "random" \| "latency" | "latency" | KinopioHub 在连接前如何排列多个候选服务器 |
 | maxReconnectAttempts | number | -1 | 最大重连尝试次数（-1 表示无限） |
 | waitOnFirstConnect | boolean | true | 等待首次连接 |
 | reconnectTimeout | number | 5000 | 重连超时时间（毫秒） |
@@ -123,6 +124,36 @@ await myVar.serve(async (request) => {
 | codec | {encode(data):Uint8Array, decode(bytes):any} | undefined | 自定义序列化编解码器 |
 | jsonReplacer | Function | undefined | JSON.stringify 的 replacer |
 | jsonReviver | Function | undefined | JSON.parse 的 reviver |
+
+兼容性方面，如果没有设置 `serverSelectionMode`，运行时仍会接受旧的 `noRandomize` 作为兼容别名，但它已经不是主要公开配置项。
+
+### 服务器选择模式
+
+- `ordered`：首次连接和底层 NATS 后续重连都保持输入顺序。
+- `random`：每次全新连接或手动重连前先重新打乱候选服务器顺序，并在该次连接生命周期内保持这份顺序稳定。
+- `latency`：默认模式。每次全新连接或手动重连前，KinopioHub 会并行探测所有配置服务器，并按 NATS 客户端 `flush()` / `rtt()` 语义测量 RTT，优先选择 RTT 更低的健康节点。探测失败的节点会保留在候选列表尾部并维持原始输入顺序；如果全部探测失败，则回退到原始输入顺序继续连接。成功进入 `latency` 模式连接后，KinopioHub 还会每 10 分钟做一次后台复测；只有发现新的健康节点至少快 30ms 时，才会先在新连接上重建值跟踪、逻辑订阅和服务，再 drain 旧连接完成热切换。在这段很短的双订阅窗口里，普通订阅回调可能出现极少量重复。
+
+### 典型模式示例
+
+```javascript
+// 固定主备顺序
+const orderedHub = new KinopioHub({
+  servers: ["wss://primary.example.com:443", "wss://backup.example.com:443"],
+  serverSelectionMode: "ordered"
+});
+
+// 每次全新连接周期都重新打乱候选顺序
+const randomHub = new KinopioHub({
+  servers: ["wss://a.example.com:443", "wss://b.example.com:443"],
+  serverSelectionMode: "random"
+});
+
+// 优先最低延时节点，并在后台自动迁移
+const latencyHub = new KinopioHub({
+  servers: ["wss://edge-a.example.com:443", "wss://edge-b.example.com:443"],
+  serverSelectionMode: "latency"
+});
+```
 
 ## 高级用法
 
@@ -190,6 +221,13 @@ console.log(response.value);
 ## 开发
 
 参见[How_To_Dev.md](./How_To_Dev.md)获取开发指南。
+
+常用验证命令：
+
+```bash
+npm test
+npm run test:bun
+```
 
 ## 许可证
 

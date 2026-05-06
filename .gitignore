@@ -130,3 +130,7 @@ dist
 .pnp.*
 package-lock.json
 id
+test*
+AGENTS.md
+PLAN*.md
+plans*

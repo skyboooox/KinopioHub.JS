@@ -1776,7 +1776,7 @@ class Variable {
     if (this.#disposed || !connection) return;
     if (this.#valueTrackingConnection === connection && this.#valueSubscription) return;
 
-    const subscription = connection.subscribe(this.#subject, { max: -1 });
+    const subscription = connection.subscribe(this.#subject);
     this.#valueSubscription = subscription;
     this.#valueTrackingConnection = connection;
     this.#clearValueTrackingRetry();

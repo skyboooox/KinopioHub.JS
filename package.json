@@ -4,23 +4,36 @@
   "description": "High-Performance Communication Middleware",
   "type": "module",
   "main": "kinopio.mjs",
+  "bin": "bin/kinopio-hub.mjs",
   "exports": {
     ".": {
       "types": "./types/index.d.ts",
       "default": "./kinopio.mjs"
+    },
+    "./leaf": {
+      "types": "./types/leaf.d.ts",
+      "default": "./leaf.mjs"
     }
   },
   "types": "./types/index.d.ts",
   "sideEffects": false,
   "files": [
+    "bin",
     "kinopio.mjs",
+    "leaf.mjs",
+    "leaf-election.mjs",
+    "leaf-mdns.mjs",
+    "leaf-runtime.mjs",
     "kinopio.d.mts",
+    "leaf.d.mts",
+    "scripts",
     "types",
     "README.md",
     "README_CN.md",
     "LICENSE"
   ],
   "scripts": {
+    "postinstall": "node ./scripts/install-nats-server.mjs",
     "test": "bun test",
     "test:bun": "bun test && bun run test:types && bun run test:bundle",
     "test:types": "tsc -p test/tsconfig.json --noEmit",

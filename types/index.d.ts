@@ -6,6 +6,14 @@ export interface KinopioCodec {
   decode(bytes: Uint8Array): unknown;
 }
 
+export interface KinopioDiscoveryOptions {
+  enabled?: boolean;
+  manifestUrl?: string;
+  backgroundLocalProbe?: boolean;
+  localSwitchTimeoutMs?: number;
+  cacheTtlMs?: number;
+}
+
 export interface KinopioOptions {
   debug?: boolean;
   servers?: string[];
@@ -26,6 +34,7 @@ export interface KinopioOptions {
   retryDelay?: number;
   maxRetryDelay?: number;
   retryBackoffFactor?: number;
+  discovery?: KinopioDiscoveryOptions;
   codec?: KinopioCodec;
   jsonReplacer?: (this: unknown, key: string, value: unknown) => unknown;
   jsonReviver?: (this: unknown, key: string, value: unknown) => unknown;

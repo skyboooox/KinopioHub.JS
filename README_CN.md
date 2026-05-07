@@ -13,12 +13,15 @@
 - 🌳 层级作用域系统
 - 🔄 自动重连处理
 - 🛡️ 内置错误处理和重试机制
+- 🧭 提供 Node-only 本地 leaf runtime、局域网自动选主、浏览器后台发现与打包 CLI
 
 ## 安装
 
 ```bash
 npm install kinopio-hub
 ```
+
+执行 `npm install` 时，当前包会尽力把官方 `nats-server v2.12.7` 预取到用户缓存目录，方便后续 Node-only leaf runtime 直接启动。如果你需要在安装时跳过这一步，可以设置 `KINOPIO_SKIP_NATS_SERVER_DOWNLOAD=1`。
 
 ## 快速开始
 
@@ -121,11 +124,14 @@ await myVar.serve(async (request) => {
 | retryDelay | number | 1000 | 初始重试延迟（毫秒） |
 | retryBackoffFactor | number | 1.5 | 退避倍数 |
 | maxRetryDelay | number | 30000 | 最大重试延迟（毫秒） |
+| discovery | `{ enabled?, manifestUrl?, backgroundLocalProbe?, localSwitchTimeoutMs?, cacheTtlMs? }` | undefined | 浏览器侧本地 leaf 后台探测与热切换配置 |
 | codec | {encode(data):Uint8Array, decode(bytes):any} | undefined | 自定义序列化编解码器 |
 | jsonReplacer | Function | undefined | JSON.stringify 的 replacer |
 | jsonReviver | Function | undefined | JSON.parse 的 reviver |
 
 兼容性方面，如果没有设置 `serverSelectionMode`，运行时仍会接受旧的 `noRandomize` 作为兼容别名，但它已经不是主要公开配置项。
+
+当 `discovery.enabled === true` 时，浏览器友好的根入口现在已经会执行后台本地 leaf 探测。默认策略仍然是“先连用户配置的远端 servers，再在后台静默探测本地 leaf”；探测失败不会阻塞首连。
 
 ### 服务器选择模式
 
@@ -155,7 +161,108 @@ const latencyHub = new KinopioHub({
 });
 ```
 
+### 浏览器本地发现
+
+```javascript
+const hub = new KinopioHub({
+  servers: ["wss://remote.example.com:443"],
+  serverSelectionMode: "ordered",
+  discovery: {
+    enabled: true,
+    manifestUrl: "https://app.example.com/.well-known/kinopio-leader.json",
+    backgroundLocalProbe: true,
+    localSwitchTimeoutMs: 1500,
+    cacheTtlMs: 5000,
+  },
+});
+```
+
+- 如果没有显式传入 `manifestUrl`，默认会使用当前页面 origin 下的 `/.well-known/kinopio-leader.json`。
+- 浏览器首次连接仍然先使用当前配置的远端 servers，然后才会在后台拉取 discovery manifest。
+- 如果 manifest 暴露了可用的本地 `wssUrl`，并且浏览器也确实成功建立了这条本地连接，KinopioHub 会先在新连接上重建值跟踪、订阅和服务，再 drain 旧连接，把当前会话热切换到本地 leaf。
+- 如果后续本地 leaf 消失，KinopioHub 会自动回退到当前配置的远端 servers，并继续在后台等待下一次可用的本地 leader。
+- 如果 manifest 拉取失败，或者浏览器无法信任 / 连接这个本地 `wss`，当前远端会话会保持不变。
+- 其他设备上的浏览器仍然要遵守正常 TLS 信任规则。在 leader 机器本机安装信任，优先帮助的是 leader 本机浏览器，而不会自动让所有远端浏览器都信任这张本地 CA。
+
+### 运行边界
+
+- 浏览器会话本身不是 leaf node，也不能直接拉起 `nats-server`。
+- 能运行 Node 的设备需要通过 `enableAutoLeaf()` 或 `kinopio-hub leaf auto` 参与发现与选主。
+- 同一个 `discoveryNamespace` 里如果已经有健康 leader，新加入的 capable device 只会停留在 `following-leader`，不会重复启动本地 leaf。
+- 在开放多设备浏览器环境下，本地优先仍然只是增强路径，因为每台浏览器设备都仍然需要各自满足 TLS 信任条件。
+
 ## 高级用法
+
+### 打包 CLI
+
+安装后，当前包会暴露一个 `kinopio-hub` CLI：
+
+```bash
+kinopio-hub --help
+kinopio-hub leaf start --discovery-namespace studio
+kinopio-hub leaf auto --discovery-namespace studio --backbone-server nats://upstream.example.com:7422
+```
+
+- `kinopio-hub leaf start` 是 `startLeafNode()` 的手动运行时封装。
+- `kinopio-hub leaf auto` 是 `enableAutoLeaf()` 的自动选主封装。
+- 这两个命令都会持续运行到你按下 `Ctrl+C`，启动时先打印一份状态快照；如果你需要纯机器可读输出，可以额外传 `--json`。
+- CLI 复用和 Node-only leaf API 相同的本地 CA / 信任安装行为，同样支持在 CI 或受限环境里设置 `KINOPIO_SKIP_CA_TRUST_INSTALL=1`。
+
+### Node-only Leaf 子路径
+
+当前包已经提供了一个只面向 Node 宿主的本地 leaf 子路径：
+
+```javascript
+import { enableAutoLeaf, startLeafNode } from "kinopio-hub/leaf";
+```
+
+`enableAutoLeaf()` 现在已经是阶段三的高层入口。它会加入一个局域网级别的协调 namespace，复用稳定缓存下来的 `nodeId`，通过 UDP 组播和 mDNS 发现现有健康 leaf，并且只在当前 namespace 缺少主节点时才启动本地 leaf。
+
+```javascript
+import { enableAutoLeaf } from "kinopio-hub/leaf";
+
+const autoLeaf = await enableAutoLeaf({
+  discoveryNamespace: "studio",
+  backboneServers: ["nats://upstream.example.com:7422"],
+  leaderMissingGraceMs: 10_000,
+});
+
+console.log(autoLeaf.status());
+
+// 稍后停止:
+await autoLeaf.stop();
+```
+
+`startLeafNode()` 继续保留为低层手动 runtime 入口。它会解析缓存里的 `nats-server` 二进制、写临时配置、启动本地 leaf server、暴露 WSS 和 HTTPS discovery manifest，并返回带有 `wssUrl`、`discoveryUrl`、`clientUrl`、`monitorUrl`、`status()`、`stop()` 的 handle。
+
+```javascript
+import { startLeafNode } from "kinopio-hub/leaf";
+
+const leaf = await startLeafNode({
+  discoveryNamespace: "studio",
+  backboneServers: ["nats://upstream.example.com:7422"],
+});
+
+console.log(leaf.status());
+await leaf.stop();
+```
+
+Leaf 运行时说明：
+
+- `backboneServers` 会被归一化为 NATS leaf remote URL，并且是可选项。即使上游不可达，`startLeafNode()` 也可以先在本地启动成功，此时 `status().bridgeState` 会保持 `"connecting"`。
+- `enableAutoLeaf()` 会保证同一个 `discoveryNamespace` 里只保留一个主 leaf。当前已经存在健康主节点时，新加入的 capable device 只会停留在 `following-leader`，不会重复拉起本地 leaf。
+- 当前主节点失联后，跟随节点会先等待 `leaderMissingGraceMs` 再参与接管。默认恢复窗口是 10 秒。
+- 当 RTT 可测时，选主优先级固定为 RTT 更低者优先、RTT 可测优先于不可测、最后再按稳定 `nodeId` 决胜；健康主节点只有在对手连续多个周期都领先至少 50ms 时才会被抢主。
+- 本地 NATS client listener 默认只绑定回环地址，而 WSS 和 discovery 默认绑定到自动探测到的局域网地址。
+- 如果你没有提供 `tls.certFile` 和 `tls.keyFile`，当前 leaf runtime 会先自动生成可复用的本地根 CA，再为当前 `advertisedHostname` 签发短期 leaf 证书，并 best-effort 尝试把这张 CA 安装到 leader 设备本机的信任链。
+- `status().tls` 会明确报告当前是使用外部 PEM 还是自动生成的本地 CA，以及 CA 信任安装结果是 `installed`、`skipped`、`failed` 还是 `external`。
+- 自动信任安装本身就是 best-effort 能力。对于开放多设备浏览器场景，即使 leader 本机已信任，本地 `wss` 仍然可能被其他未安装 CA 的设备拒绝。
+- 如果你在 CI、自动化脚本或受限环境里不希望修改信任链，可以设置 `KINOPIO_SKIP_CA_TRUST_INSTALL=1`。
+- 根入口 `kinopio-hub` 继续保持浏览器友好，不会引入 Node-only 的进程控制逻辑。
+- 当前仓库内可直接参考的示例：
+  [example/leaf-entrypoint.mjs](./example/leaf-entrypoint.mjs)，
+  [example/auto-leaf.mjs](./example/auto-leaf.mjs)，
+  [example/browser-discovery.mjs](./example/browser-discovery.mjs)
 
 ### 连接管理
 

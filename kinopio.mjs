@@ -8,6 +8,81 @@ const SERVER_SELECTION_MODES = new Set(["ordered", "random", "latency"]);
 const DEFAULT_SERVER_SELECTION_MODE = "latency";
 const LATENCY_REPROBE_INTERVAL_MS = 10 * 60 * 1000;
 const LATENCY_SWITCH_THRESHOLD_MS = 30;
+const DEFAULT_DISCOVERY_MANIFEST_PATH = "/.well-known/kinopio-leader.json";
+const DEFAULT_DISCOVERY_CACHE_TTL_MS = 5_000;
+const DEFAULT_LOCAL_SWITCH_TIMEOUT_MS = 1_500;
+const BROWSER_CONNECT_PROTOCOLS = new Set(["http:", "https:", "ws:", "wss:", "nats:", "tls:"]);
+
+function isPlainObject(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function isPositiveFiniteNumber(value) {
+  return typeof value === "number" && Number.isFinite(value) && value > 0;
+}
+
+function uniqueServers(servers) {
+  return [...new Set(servers)];
+}
+
+function normalizeBrowserConnectServer(value) {
+  if (typeof value !== "string" || value.trim() === "") {
+    return null;
+  }
+
+  try {
+    const normalized = value.trim();
+    const parsed = new URL(normalized);
+    if (!BROWSER_CONNECT_PROTOCOLS.has(parsed.protocol)) {
+      return null;
+    }
+    return normalized;
+  } catch {
+    return null;
+  }
+}
+
+function normalizeDiscoveryManifest(manifest) {
+  if (!isPlainObject(manifest)) {
+    return null;
+  }
+
+  const wssUrl = normalizeBrowserConnectServer(manifest.wssUrl);
+  const expiresAtCandidate =
+    typeof manifest.expiresAt === "string" && manifest.expiresAt.trim() !== ""
+      ? manifest.expiresAt
+      : typeof manifest.leaseExpiresAt === "string" && manifest.leaseExpiresAt.trim() !== ""
+        ? manifest.leaseExpiresAt
+        : null;
+  const expiresAtTimestamp = expiresAtCandidate ? Date.parse(expiresAtCandidate) : Number.NaN;
+  if (!wssUrl || !Number.isFinite(expiresAtTimestamp) || expiresAtTimestamp <= Date.now()) {
+    return null;
+  }
+
+  return {
+    version: typeof manifest.version === "string" ? manifest.version : "1",
+    expiresAt: new Date(expiresAtTimestamp).toISOString(),
+    leaderEpoch: Number.isInteger(manifest.leaderEpoch) && manifest.leaderEpoch >= 0 ? manifest.leaderEpoch : 0,
+    advertisedHostname: typeof manifest.advertisedHostname === "string" ? manifest.advertisedHostname : "",
+    wssUrl,
+    fallbackServers: Array.isArray(manifest.fallbackServers)
+      ? manifest.fallbackServers
+        .map(normalizeBrowserConnectServer)
+        .filter(Boolean)
+      : [],
+    backboneRttMs: isPositiveFiniteNumber(manifest.backboneRttMs) || manifest.backboneRttMs === 0
+      ? manifest.backboneRttMs
+      : null,
+    discoveryUrl:
+      typeof manifest.discoveryUrl === "string" && manifest.discoveryUrl.trim() !== ""
+        ? manifest.discoveryUrl
+        : undefined,
+    leaseExpiresAt:
+      typeof manifest.leaseExpiresAt === "string" && manifest.leaseExpiresAt.trim() !== ""
+        ? manifest.leaseExpiresAt
+        : undefined,
+  };
+}
 
 /**
  * KinopioHub - A modern NATS client for real-time communication
@@ -53,6 +128,10 @@ export class KinopioHub {
   #retryAttempt = 0;
   #currentRetryDelay = 0;
   #latencyProbeTimer = null;
+  #discoveryProbeTimer = null;
+  #discoveryProbePromise = null;
+  #discoveryManifestCache = null;
+  #discoveryManifestCacheExpiresAt = 0;
   
   /**
    * Creates a new KinopioHub instance
@@ -72,6 +151,12 @@ export class KinopioHub {
    * @param {number} [options.retryDelay=1000] - Initial retry delay in ms
    * @param {number} [options.maxRetryDelay=30000] - Maximum retry delay in ms
    * @param {number} [options.retryBackoffFactor=1.5] - Backoff multiplier for retry delays
+   * @param {Object} [options.discovery] - Browser-side local leaf discovery controls
+   * @param {boolean} [options.discovery.enabled] - Enable the browser-side local leaf enhancement path
+   * @param {string} [options.discovery.manifestUrl] - Override the discovery manifest URL used by the browser-side local probe flow
+   * @param {boolean} [options.discovery.backgroundLocalProbe=true] - Keep probing in the background after the initial remote connection is ready
+   * @param {number} [options.discovery.localSwitchTimeoutMs=1500] - Timeout for switching the current browser session to a discovered local leaf
+   * @param {number} [options.discovery.cacheTtlMs=5000] - Cache TTL for browser-side manifest reuse and re-probe cadence
    * @param {Object} [options.codec] - Custom codec with encode(data) and decode(bytes)
    * @param {Function} [options.jsonReplacer] - JSON.stringify replacer
    * @param {Function} [options.jsonReviver] - JSON.parse reviver
@@ -97,6 +182,7 @@ export class KinopioHub {
       retryDelay: 1000,
       maxRetryDelay: 30000,
       retryBackoffFactor: 1.5,
+      discovery: undefined,
       jsonReplacer: undefined,
       jsonReviver: undefined,
       codec: undefined,
@@ -197,6 +283,55 @@ export class KinopioHub {
     this.#latencyProbeTimer = null;
   }
 
+  #clearDiscoveryProbeTimer() {
+    if (!this.#discoveryProbeTimer) return;
+    this.#clearTimer(this.#discoveryProbeTimer);
+    this.#discoveryProbeTimer = null;
+  }
+
+  #clearDiscoveryManifestCache() {
+    this.#discoveryManifestCache = null;
+    this.#discoveryManifestCacheExpiresAt = 0;
+  }
+
+  #resolveDiscoveryOptions() {
+    const discovery = this.#options.discovery;
+    if (!this.isBrowser || !isPlainObject(discovery) || discovery.enabled !== true) {
+      return null;
+    }
+
+    let manifestUrl = null;
+
+    if (typeof discovery.manifestUrl === "string" && discovery.manifestUrl.trim() !== "") {
+      try {
+        manifestUrl = new URL(discovery.manifestUrl.trim(), globalThis.window?.location?.href).toString();
+      } catch {
+        manifestUrl = null;
+      }
+    } else {
+      try {
+        manifestUrl = new URL(DEFAULT_DISCOVERY_MANIFEST_PATH, globalThis.window?.location?.href).toString();
+      } catch {
+        manifestUrl = null;
+      }
+    }
+
+    if (!manifestUrl) {
+      return null;
+    }
+
+    return {
+      manifestUrl,
+      backgroundLocalProbe: discovery.backgroundLocalProbe !== false,
+      localSwitchTimeoutMs: isPositiveFiniteNumber(discovery.localSwitchTimeoutMs)
+        ? Math.floor(discovery.localSwitchTimeoutMs)
+        : DEFAULT_LOCAL_SWITCH_TIMEOUT_MS,
+      cacheTtlMs: isPositiveFiniteNumber(discovery.cacheTtlMs)
+        ? Math.floor(discovery.cacheTtlMs)
+        : DEFAULT_DISCOVERY_CACHE_TTL_MS,
+    };
+  }
+
   #createBaseConnectOptions() {
     const {
       serverSelectionMode,
@@ -206,6 +341,7 @@ export class KinopioHub {
       maxRetryDelay,
       retryBackoffFactor,
       healthReport,
+      discovery,
       codec,
       jsonReplacer,
       jsonReviver,
@@ -455,6 +591,15 @@ export class KinopioHub {
     return connectionPlan?.mode === "latency" && connectionPlan?.sourceCandidates?.length > 1;
   }
 
+  #isUsingDiscoveryLocalConnection(connectionPlan = this.#activeConnectionPlan) {
+    if (!connectionPlan?.discoveryLocalServer || !this.#activeConnection) {
+      return false;
+    }
+
+    const currentServer = this.#activeConnection.getServer?.() ?? connectionPlan.connectedServer ?? null;
+    return currentServer === connectionPlan.discoveryLocalServer;
+  }
+
   #scheduleLatencyProbeCycle() {
     this.#clearLatencyProbeTimer();
 
@@ -468,6 +613,22 @@ export class KinopioHub {
         this.#log("error", "Latency re-probe cycle failed:", error);
       });
     }, LATENCY_REPROBE_INTERVAL_MS);
+  }
+
+  #scheduleDiscoveryProbeCycle(delayMs = 0) {
+    this.#clearDiscoveryProbeTimer();
+
+    const discoveryOptions = this.#resolveDiscoveryOptions();
+    if (!discoveryOptions?.backgroundLocalProbe || !this.#activeConnection || this.state !== "connected") {
+      return;
+    }
+
+    this.#discoveryProbeTimer = this.#createTimer(() => {
+      this.#discoveryProbeTimer = null;
+      this.#runDiscoveryProbeCycle().catch(error => {
+        this.#log("warn", "Background local leaf probe failed:", error);
+      });
+    }, Math.max(0, delayMs));
   }
 
   async #runLatencyProbeCycle() {
@@ -490,6 +651,11 @@ export class KinopioHub {
     const currentPlan = this.#activeConnectionPlan;
 
     if (!this.#activeConnection || this.state !== "connected" || !this.#supportsLatencyMonitoring(currentPlan)) {
+      return false;
+    }
+
+    if (this.#isUsingDiscoveryLocalConnection(currentPlan)) {
+      this.#log("debug", "Skipping background latency hot switch while a discovered local leaf is active");
       return false;
     }
 
@@ -546,7 +712,212 @@ export class KinopioHub {
     return true;
   }
 
-  async #openConnection(connectionPlan, label = "connection") {
+  async #fetchDiscoveryManifest(discoveryOptions, { forceRefresh = false } = {}) {
+    if (!forceRefresh && this.#discoveryManifestCacheExpiresAt > Date.now()) {
+      return this.#discoveryManifestCache;
+    }
+
+    if (typeof fetch !== "function") {
+      throw new Error("fetch() is not available in this runtime");
+    }
+
+    let timeoutId = null;
+    let signal;
+
+    if (typeof AbortController !== "undefined") {
+      const controller = new AbortController();
+      signal = controller.signal;
+      timeoutId = this.#createTimer(() => {
+        controller.abort(new Error("Discovery manifest fetch timed out"));
+      }, discoveryOptions.localSwitchTimeoutMs);
+    }
+
+    try {
+      const response = await fetch(discoveryOptions.manifestUrl, {
+        method: "GET",
+        cache: "no-store",
+        signal,
+      });
+
+      if (response.status === 204 || response.status === 404) {
+        this.#discoveryManifestCache = null;
+        this.#discoveryManifestCacheExpiresAt = Date.now() + discoveryOptions.cacheTtlMs;
+        return null;
+      }
+
+      if (!response.ok) {
+        throw new Error(`Discovery manifest fetch failed with HTTP ${response.status}`);
+      }
+
+      const manifest = normalizeDiscoveryManifest(await response.json());
+      this.#discoveryManifestCache = manifest;
+      this.#discoveryManifestCacheExpiresAt = Date.now() + discoveryOptions.cacheTtlMs;
+      return manifest;
+    } finally {
+      if (timeoutId) {
+        this.#clearTimer(timeoutId);
+      }
+    }
+  }
+
+  #buildDiscoveryPreferredPlan(localServer, manifest, basePlan, manifestUrl) {
+    const remoteSourceCandidates = uniqueServers(
+      (basePlan?.sourceCandidates || this.#normalizeServerCandidates())
+        .filter(server => server !== localServer),
+    );
+    const remoteOrderedCandidates = uniqueServers(
+      (basePlan?.orderedCandidates || remoteSourceCandidates)
+        .filter(server => server !== localServer),
+    );
+
+    return {
+      ...(basePlan || {}),
+      mode: basePlan?.mode || this.#resolveServerSelectionMode(),
+      sourceCandidates: remoteSourceCandidates,
+      orderedCandidates: uniqueServers([localServer, ...remoteOrderedCandidates]),
+      createdAt: Date.now(),
+      latencyProbePending: false,
+      latencyProbeFailedAll: false,
+      probeResults: basePlan?.probeResults || [],
+      discoveryLocalServer: localServer,
+      discoveryManifest: manifest,
+      discoveryManifestUrl: manifestUrl,
+      preferDiscoveryLocal: true,
+    };
+  }
+
+  async #switchToRemoteDiscoveryFallback(discoveryOptions, reason) {
+    const currentPlan = this.#activeConnectionPlan;
+    const currentServer = this.#activeConnection?.getServer?.() ?? currentPlan?.connectedServer ?? null;
+
+    if (!currentPlan?.discoveryLocalServer || currentServer !== currentPlan.discoveryLocalServer) {
+      return false;
+    }
+
+    const remotePlan = await this.#createConnectionPlan();
+    this.#log("info", "Discovery probe is falling back to the configured remote servers", {
+      reason,
+      from: currentServer,
+      manifestUrl: discoveryOptions.manifestUrl,
+    });
+    await this.#switchActiveConnection(remotePlan, {
+      timeoutMs: discoveryOptions.localSwitchTimeoutMs,
+    });
+    return true;
+  }
+
+  async #applyDiscoveryManifest(manifest, discoveryOptions) {
+    const currentPlan = this.#activeConnectionPlan;
+    const currentServer = this.#activeConnection?.getServer?.() ?? currentPlan?.connectedServer ?? null;
+
+    if (!manifest) {
+      return await this.#switchToRemoteDiscoveryFallback(discoveryOptions, "no usable local leader manifest");
+    }
+
+    const localServer = manifest.wssUrl;
+    if (!localServer) {
+      return await this.#switchToRemoteDiscoveryFallback(discoveryOptions, "manifest did not expose a usable wssUrl");
+    }
+
+    if (currentPlan?.discoveryLocalServer === localServer && currentServer === localServer) {
+      currentPlan.discoveryManifest = manifest;
+      currentPlan.discoveryManifestUrl = discoveryOptions.manifestUrl;
+      return false;
+    }
+
+    const nextPlan = this.#buildDiscoveryPreferredPlan(
+      localServer,
+      manifest,
+      currentPlan,
+      discoveryOptions.manifestUrl,
+    );
+
+    try {
+      await this.#switchActiveConnection(nextPlan, {
+        timeoutMs: discoveryOptions.localSwitchTimeoutMs,
+        expectedServer: localServer,
+      });
+      this.#log("info", "Background local leaf probe switched the current session to a discovered local leaf", {
+        to: localServer,
+        manifestUrl: discoveryOptions.manifestUrl,
+      });
+      return true;
+    } catch (error) {
+      this.#log("warn", "Background local leaf probe could not switch to the discovered local leaf; keeping the current connection", {
+        to: localServer,
+        manifestUrl: discoveryOptions.manifestUrl,
+        error: error.message,
+      });
+      return false;
+    }
+  }
+
+  async #runDiscoveryProbeCycle({ forceRefresh = false, reschedule = true } = {}) {
+    const discoveryOptions = this.#resolveDiscoveryOptions();
+    if (!discoveryOptions || !this.#activeConnection || this.state !== "connected") {
+      return false;
+    }
+
+    if (this.#candidateConnection || this.#pendingConnectionPlan) {
+      return false;
+    }
+
+    if (this.#discoveryProbePromise) {
+      return await this.#discoveryProbePromise;
+    }
+
+    const cyclePromise = (async () => {
+      try {
+        const manifest = await this.#fetchDiscoveryManifest(discoveryOptions, { forceRefresh });
+        return await this.#applyDiscoveryManifest(manifest, discoveryOptions);
+      } catch (error) {
+        this.#log("warn", "Background local leaf probe request failed; keeping the current connection", {
+          manifestUrl: discoveryOptions.manifestUrl,
+          error: error.message,
+        });
+        return false;
+      } finally {
+        if (reschedule && discoveryOptions.backgroundLocalProbe && this.#activeConnection) {
+          this.#scheduleDiscoveryProbeCycle(discoveryOptions.cacheTtlMs);
+        }
+      }
+    })().finally(() => {
+      if (this.#discoveryProbePromise === cyclePromise) {
+        this.#discoveryProbePromise = null;
+      }
+    });
+
+    this.#discoveryProbePromise = cyclePromise;
+    return await cyclePromise;
+  }
+
+  async #startDiscoveryFlowForActiveConnection({ immediateProbe = false } = {}) {
+    const discoveryOptions = this.#resolveDiscoveryOptions();
+    if (!discoveryOptions || !this.#activeConnection) {
+      return;
+    }
+
+    this.#clearDiscoveryProbeTimer();
+
+    if (this.#activeConnectionPlan?.discoveryLocalServer) {
+      if (discoveryOptions.backgroundLocalProbe) {
+        this.#scheduleDiscoveryProbeCycle(discoveryOptions.cacheTtlMs);
+      }
+      return;
+    }
+
+    if (discoveryOptions.backgroundLocalProbe) {
+      this.#scheduleDiscoveryProbeCycle(immediateProbe ? 0 : discoveryOptions.cacheTtlMs);
+      return;
+    }
+
+    await this.#runDiscoveryProbeCycle({
+      forceRefresh: true,
+      reschedule: false,
+    });
+  }
+
+  async #openConnection(connectionPlan, label = "connection", timeoutMs = this.#options.timeout || 10000) {
     let timeoutId = null;
     let connectionTimedOut = false;
     let connection = null;
@@ -564,7 +935,7 @@ export class KinopioHub {
         timeoutId = this.#createTimer(() => {
           connectionTimedOut = true;
           reject(new Error("NATS connection timeout"));
-        }, this.#options.timeout || 10000);
+        }, timeoutMs);
       });
 
       connection = await Promise.race([connectPromise, timeoutPromise]);
@@ -578,22 +949,28 @@ export class KinopioHub {
     }
   }
 
-  async #switchActiveConnection(connectionPlan) {
+  async #switchActiveConnection(connectionPlan, { timeoutMs, expectedServer } = {}) {
     const previousConnection = this.#activeConnection;
     let candidateConnection = null;
 
     try {
-      candidateConnection = await this.#openConnection(connectionPlan, "candidate connection");
+      candidateConnection = await this.#openConnection(connectionPlan, "candidate connection", timeoutMs);
       await this.#setCandidateConnection(candidateConnection, connectionPlan);
       await this.#verifyConnection(candidateConnection);
       await this.#rebuildRegisteredState(candidateConnection);
       await candidateConnection.flush();
 
       connectionPlan.connectedServer = candidateConnection.getServer?.() ?? connectionPlan.orderedCandidates[0];
+      if (expectedServer && connectionPlan.connectedServer !== expectedServer) {
+        throw new Error(
+          `Expected discovery switch to connect ${expectedServer}, but the candidate connection settled on ${connectionPlan.connectedServer}`,
+        );
+      }
 
       await this.#promoteCandidateConnection(candidateConnection, connectionPlan);
       this.#startHealthCheck(candidateConnection);
       this.#scheduleLatencyProbeCycle();
+      await this.#startDiscoveryFlowForActiveConnection({ immediateProbe: false });
 
       if (previousConnection && previousConnection !== candidateConnection) {
         await this.#closeConnection(previousConnection, "previous active connection after hot switch");
@@ -724,6 +1101,7 @@ export class KinopioHub {
         this.#startHealthCheck(candidateConnection);
         this.#scheduleLatencyProbeCycle();
         await this.#setState("connected");
+        await this.#startDiscoveryFlowForActiveConnection({ immediateProbe: true });
         
         // Reset retry state on successful connection
         this.#retryAttempt = 0;
@@ -883,7 +1261,10 @@ export class KinopioHub {
   async #cleanup() {
     this.#healthCheckActive = false;
     this.#clearLatencyProbeTimer();
+    this.#clearDiscoveryProbeTimer();
     this.#clearAllTimers();
+    this.#clearDiscoveryManifestCache();
+    this.#discoveryProbePromise = null;
 
     const activeConnection = this.#activeConnection;
     const candidateConnection = this.#candidateConnection;

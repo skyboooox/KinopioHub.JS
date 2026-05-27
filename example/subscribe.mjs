@@ -1,55 +1,30 @@
-import { KinopioHub } from '../kinopio.mjs';
+import { uniqueName, usingDemoHub } from "./_shared.mjs";
 
-// Subscribing to messages example
-console.log('=== KinopioHub Subscription Example ===');
+await usingDemoHub(async (hub) => {
+  const events = hub.getScope(uniqueName("subscribe")).getVariable("events");
+  const received = [];
 
-async function subscribeExample() {
+  let resolveDone;
+  const done = new Promise((resolve) => {
+    resolveDone = resolve;
+  });
+
+  const subscription = await events.sub((value) => {
+    received.push(value);
+    console.log("received:", value);
+    if (received.length === 2) {
+      resolveDone();
+    }
+  });
+
   try {
-    const hub = new KinopioHub({
-      servers: ["wss://demo.nats.io:8443"],
-      debug: true
-    });
+    await hub.nats.flush();
+    await events.pub({ seq: 1, at: Date.now() });
+    await events.pub({ seq: 2, at: Date.now() });
 
-    await hub.connected();
-    console.log('✅ Connected to NATS server');
-
-    // Get a scope and variable
-    const chatScope = hub.getScope('chat');
-    const messagesVar = chatScope.getVariable('messages');
-
-    console.log('Setting up subscription...');
-
-    // Subscribe to messages
-    await messagesVar.sub((data) => {
-      console.log('📨 Received message:', {
-        from: data.user,
-        content: data.message,
-        time: new Date(data.timestamp).toLocaleTimeString()
-      });
-      
-      if (data.type === 'warning') {
-        console.log('⚠️  Warning message detected!');
-      }
-    });
-
-    console.log('✅ Subscription active. Waiting for messages...');
-    console.log('💡 Run publish.mjs in another terminal to see messages');
-
-    // Keep the subscription alive
-    console.log('Press Ctrl+C to stop listening');
-
-    // Graceful shutdown
-    process.on('SIGINT', async () => {
-      console.log('\nShutting down...');
-      await hub.dispose();
-      console.log('✅ Disconnected');
-      process.exit(0);
-    });
-
-  } catch (error) {
-    console.error('❌ Subscription failed:', error.message);
-    process.exit(1);
+    await done;
+    console.log("subscription saw", received.length, "messages");
+  } finally {
+    subscription.unsubscribe();
   }
-}
-
-subscribeExample();
+});

@@ -268,6 +268,8 @@ export function buildMdnsAnnouncementPacket({
   advertisedAddress,
   discoveryPort,
   websocketPort,
+  websocketProtocol = "wss",
+  discoveryProtocol = "https",
   leaderEpoch,
   leaseExpiresAt,
   backboneRttMs,
@@ -277,6 +279,8 @@ export function buildMdnsAnnouncementPacket({
   const normalizedServiceType = ensureTrailingDot(serviceTypeName);
   const instanceName = buildServiceInstanceName(discoveryNamespace, nodeId);
   const hostName = buildHostRecordName(nodeId);
+  const normalizedWebsocketProtocol = websocketProtocol === "ws" ? "ws" : "wss";
+  const normalizedDiscoveryProtocol = discoveryProtocol === "http" ? "http" : "https";
   const txtStrings = [
     "txtvers=1",
     `ns=${discoveryNamespace}`,
@@ -285,6 +289,8 @@ export function buildMdnsAnnouncementPacket({
     `epoch=${leaderEpoch}`,
     `lease=${leaseExpiresAt}`,
     `wssp=${websocketPort}`,
+    `wsproto=${normalizedWebsocketProtocol}`,
+    `discproto=${normalizedDiscoveryProtocol}`,
     `rtt=${backboneRttMs ?? ""}`,
   ];
 
@@ -419,6 +425,8 @@ export function extractKinopioLeafManifests(packet, {
     const namespace = txt.ns;
     const nodeId = txt.node;
     const websocketPort = Number(txt.wssp);
+    const websocketProtocol = txt.wsproto === "ws" ? "ws" : "wss";
+    const discoveryProtocol = txt.discproto === "http" ? "http" : "https";
     const leaderEpoch = Number(txt.epoch || 0);
     const leaseExpiresAt = txt.lease;
     const backboneRttMs = txt.rtt === "" ? null : Number(txt.rtt);
@@ -436,8 +444,9 @@ export function extractKinopioLeafManifests(packet, {
       leaseExpiresAt,
       backboneRttMs: Number.isFinite(backboneRttMs) ? backboneRttMs : null,
       advertisedHostname,
-      wssUrl: `wss://${advertisedHostname}:${websocketPort}`,
-      discoveryUrl: `https://${advertisedHostname}:${entry.srv.data.port}${manifestPath}`,
+      websocketUrl: `${websocketProtocol}://${advertisedHostname}:${websocketPort}`,
+      wssUrl: `${websocketProtocol}://${advertisedHostname}:${websocketPort}`,
+      discoveryUrl: `${discoveryProtocol}://${advertisedHostname}:${entry.srv.data.port}${manifestPath}`,
       fallbackServers: [],
       nodeId,
       discoveryNamespace: namespace,

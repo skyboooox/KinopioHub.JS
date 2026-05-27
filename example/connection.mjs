@@ -1,38 +1,29 @@
-import { KinopioHub } from '../kinopio.mjs';
+import { DEMO_SERVER, createDemoHub } from "./_shared.mjs";
 
-// Basic connection example
-console.log('=== KinopioHub Connection Example ===');
+console.log("Connecting to", DEMO_SERVER);
 
-async function connectionExample() {
-  try {
-    // Create a new hub instance
-    const hub = new KinopioHub({
-      servers: ["wss://demo.nats.io:8443"],
-      debug: true
-    });
+const hub = createDemoHub({
+  autoConnect: false,
+});
 
-    console.log('Connecting to NATS server...');
-    
-    // Wait for connection
-    await hub.connected();
-    console.log('✅ Connected successfully!');
+const stopStateLog = hub.onStateChange((state) => {
+  console.log("state:", state);
+});
 
-    // Check connection status
-    console.log('Connection state:', hub.state);
-    console.log('Is connected:', hub.isConnected);
+try {
+  await hub.connect();
+  await hub.connected(10_000);
 
-    // Keep connection alive for a few seconds
-    setTimeout(async () => {
-      console.log('Disconnecting...');
-      await hub.dispose();
-      console.log('✅ Disconnected gracefully');
-      process.exit(0);
-    }, 3000);
+  console.log("connected:", hub.isConnected);
+  console.log("server:", hub.nats?.getServer?.());
 
-  } catch (error) {
-    console.error('❌ Connection failed:', error.message);
-    process.exit(1);
-  }
+  const bytes = hub.serializeData({ ok: true });
+  console.log("serialization round trip:", hub.deserializeData(bytes));
+
+  await hub.reconnect();
+  await hub.connected(10_000);
+  console.log("reconnected:", hub.state);
+} finally {
+  stopStateLog();
+  await hub.dispose();
 }
-
-connectionExample();

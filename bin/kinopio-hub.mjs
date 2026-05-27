@@ -21,11 +21,12 @@ Common options:
   --cache-dir <path>             Override the user cache root used for runtime assets.
   --binary-path <path>           Use an explicit nats-server binary instead of the cached one.
   --runtime-dir <path>           Place the temporary runtime directory under the given parent.
-  --lan-bind-address <ip>        Override the LAN bind address used for WSS and discovery listeners.
+  --lan-bind-address <ip>        Override the LAN bind address used for WebSocket and discovery listeners.
   --client-port <port>           Fixed local NATS client port.
-  --websocket-port <port>        Fixed local WSS port.
-  --discovery-port <port>        Fixed local discovery HTTPS port.
+  --websocket-port <port>        Fixed local WebSocket port.
+  --discovery-port <port>        Fixed local discovery manifest port.
   --monitor-port <port>          Fixed local monitoring port.
+  --no-websocket-tls             Expose ws:// and http:// discovery instead of wss:// and https://.
   --tls-cert-file <path>         Use an explicit PEM certificate instead of the generated local CA flow.
   --tls-key-file <path>          Use an explicit PEM private key instead of the generated local CA flow.
   --json                         Print the initial status snapshot as JSON only.
@@ -130,6 +131,9 @@ function parseLeafOptions(args) {
       case "--monitor-port":
         setNestedOption(options, "ports", "monitor", parsePositiveInteger(requireFlagValue(args, ++index, argument), argument));
         break;
+      case "--no-websocket-tls":
+        options.webSocketTls = false;
+        break;
       case "--tls-cert-file":
         setNestedOption(options, "tls", "certFile", requireFlagValue(args, ++index, argument));
         break;
@@ -216,14 +220,16 @@ async function runLeafCommand(mode, parsed) {
 
   if (mode === "start") {
     const handle = await startLeafNode(parsed.options);
+    const termination = waitForTermination(() => handle.stop(), "local leaf runtime", parsed.json);
     renderStatusSnapshot("Local leaf runtime", handle.status(), parsed.json);
-    await waitForTermination(() => handle.stop(), "local leaf runtime", parsed.json);
+    await termination;
     return;
   }
 
   const handle = await enableAutoLeaf(parsed.options);
+  const termination = waitForTermination(() => handle.stop(), "auto leaf agent", parsed.json);
   renderStatusSnapshot("Auto leaf agent", handle.status(), parsed.json);
-  await waitForTermination(() => handle.stop(), "auto leaf agent", parsed.json);
+  await termination;
 }
 
 async function main(argv) {

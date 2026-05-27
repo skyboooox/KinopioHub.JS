@@ -109,13 +109,19 @@ export function normalizeBackboneServerUrl(value) {
     return parsed.toString();
   }
 
-  if (parsed.protocol === "nats-leaf:" || parsed.protocol === "ws:") {
+  if (
+    parsed.protocol === "nats-leaf:" ||
+    parsed.protocol === "tls:" ||
+    parsed.protocol === "ws:" ||
+    parsed.protocol === "wss:"
+  ) {
     return parsed.toString();
   }
 
   throw new TypeError(
     `Unsupported backbone server URL protocol "${parsed.protocol}". ` +
-    `Use nats://, nats-leaf://, or ws:// URLs for stage-2 leaf remotes.`,
+    `Use nats:// or nats-leaf:// for native leafnode remotes, ` +
+    `tls:// for TLS-first leafnode remotes, or ws:// / wss:// for WebSocket leaf remotes.`,
   );
 }
 

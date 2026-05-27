@@ -14,6 +14,11 @@ export interface KinopioDiscoveryOptions {
   cacheTtlMs?: number;
 }
 
+export type KinopioAutoLeafOptions = Omit<import("./leaf").AutoLeafOptions, "discoveryNamespace"> & {
+  discoveryNamespace?: import("./leaf").AutoLeafOptions["discoveryNamespace"];
+  enabled?: boolean;
+};
+
 export interface KinopioOptions {
   debug?: boolean;
   servers?: string[];
@@ -34,7 +39,8 @@ export interface KinopioOptions {
   retryDelay?: number;
   maxRetryDelay?: number;
   retryBackoffFactor?: number;
-  discovery?: KinopioDiscoveryOptions;
+  discovery?: false | KinopioDiscoveryOptions;
+  autoLeaf?: boolean | KinopioAutoLeafOptions;
   codec?: KinopioCodec;
   jsonReplacer?: (this: unknown, key: string, value: unknown) => unknown;
   jsonReviver?: (this: unknown, key: string, value: unknown) => unknown;

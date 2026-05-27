@@ -11,7 +11,8 @@ const LATENCY_SWITCH_THRESHOLD_MS = 30;
 const DEFAULT_DISCOVERY_MANIFEST_PATH = "/.well-known/kinopio-leader.json";
 const DEFAULT_DISCOVERY_CACHE_TTL_MS = 5_000;
 const DEFAULT_LOCAL_SWITCH_TIMEOUT_MS = 1_500;
-const BROWSER_CONNECT_PROTOCOLS = new Set(["http:", "https:", "ws:", "wss:", "nats:", "tls:"]);
+const CLIENT_CONNECT_PROTOCOLS = new Set(["ws:", "wss:"]);
+const DISCOVERY_MANIFEST_PROTOCOLS = new Set(["http:", "https:"]);
 
 function isPlainObject(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -21,25 +22,99 @@ function isPositiveFiniteNumber(value) {
   return typeof value === "number" && Number.isFinite(value) && value > 0;
 }
 
+function isNodeRuntime() {
+  return (
+    typeof process !== "undefined" &&
+    process?.versions !== undefined &&
+    typeof process.versions.node === "string"
+  );
+}
+
+async function importLeafEntrypoint() {
+  return await import(new URL("./leaf.mjs", import.meta.url).href);
+}
+
 function uniqueServers(servers) {
   return [...new Set(servers)];
 }
 
-function normalizeBrowserConnectServer(value) {
-  if (typeof value !== "string" || value.trim() === "") {
-    return null;
+function normalizeServerIdentity(value) {
+  if (typeof value !== "string") {
+    return "";
+  }
+
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return "";
   }
 
   try {
-    const normalized = value.trim();
-    const parsed = new URL(normalized);
-    if (!BROWSER_CONNECT_PROTOCOLS.has(parsed.protocol)) {
-      return null;
+    const parsed = new URL(trimmed);
+    if (parsed.hostname) {
+      const port = parsed.port || (
+        parsed.protocol === "wss:" || parsed.protocol === "https:" || parsed.protocol === "tls:"
+          ? "443"
+          : "80"
+      );
+      return `${parsed.hostname}:${port}`;
     }
-    return normalized;
   } catch {
-    return null;
+    // Fall back to the client-reported host:port form below.
   }
+
+  return trimmed
+    .replace(/^[a-z][a-z\d+.-]*:\/\//iu, "")
+    .split(/[/?#]/u)[0];
+}
+
+function serversMatch(left, right) {
+  const leftIdentity = normalizeServerIdentity(left);
+  const rightIdentity = normalizeServerIdentity(right);
+  return Boolean(leftIdentity && rightIdentity && leftIdentity === rightIdentity);
+}
+
+function normalizeClientConnectServer(value, label = "server") {
+  if (typeof value !== "string" || value.trim() === "") {
+    throw new TypeError(`${label} must be a non-empty ws:// or wss:// URL string`);
+  }
+
+  const normalized = value.trim();
+  let parsed;
+
+  try {
+    parsed = new URL(normalized);
+  } catch {
+    throw new TypeError(`${label} must be a valid ws:// or wss:// URL string`);
+  }
+
+  if (!CLIENT_CONNECT_PROTOCOLS.has(parsed.protocol)) {
+    throw new TypeError(
+      `Unsupported KinopioHub server URL protocol "${parsed.protocol}" in ${label}. KinopioHub client connections only support ws:// or wss:// URLs.`,
+    );
+  }
+
+  return normalized;
+}
+
+function normalizeDiscoveryEndpointUrl(value, label = "discovery manifest URL") {
+  if (typeof value !== "string" || value.trim() === "") {
+    throw new TypeError(`${label} must be a non-empty http:// or https:// URL string`);
+  }
+
+  const normalized = value.trim();
+  let parsed;
+
+  try {
+    parsed = new URL(normalized);
+  } catch {
+    throw new TypeError(`${label} must be a valid http:// or https:// URL string`);
+  }
+
+  if (!DISCOVERY_MANIFEST_PROTOCOLS.has(parsed.protocol)) {
+    throw new TypeError(`${label} must use http:// or https://`);
+  }
+
+  return normalized;
 }
 
 function normalizeDiscoveryManifest(manifest) {
@@ -47,7 +122,12 @@ function normalizeDiscoveryManifest(manifest) {
     return null;
   }
 
-  const wssUrl = normalizeBrowserConnectServer(manifest.wssUrl);
+  const rawWebsocketUrl =
+    typeof manifest.websocketUrl === "string" && manifest.websocketUrl.trim() !== ""
+      ? manifest.websocketUrl
+      : typeof manifest.wssUrl === "string" && manifest.wssUrl.trim() !== ""
+        ? manifest.wssUrl
+        : null;
   const expiresAtCandidate =
     typeof manifest.expiresAt === "string" && manifest.expiresAt.trim() !== ""
       ? manifest.expiresAt
@@ -55,31 +135,52 @@ function normalizeDiscoveryManifest(manifest) {
         ? manifest.leaseExpiresAt
         : null;
   const expiresAtTimestamp = expiresAtCandidate ? Date.parse(expiresAtCandidate) : Number.NaN;
-  if (!wssUrl || !Number.isFinite(expiresAtTimestamp) || expiresAtTimestamp <= Date.now()) {
+  if (!rawWebsocketUrl || !Number.isFinite(expiresAtTimestamp) || expiresAtTimestamp <= Date.now()) {
     return null;
   }
+
+  const websocketUrl = normalizeClientConnectServer(rawWebsocketUrl, "discovery manifest websocketUrl");
+  const discoveryUrl =
+    typeof manifest.discoveryUrl === "string" && manifest.discoveryUrl.trim() !== ""
+      ? normalizeDiscoveryEndpointUrl(manifest.discoveryUrl, "discovery manifest discoveryUrl")
+      : undefined;
 
   return {
     version: typeof manifest.version === "string" ? manifest.version : "1",
     expiresAt: new Date(expiresAtTimestamp).toISOString(),
     leaderEpoch: Number.isInteger(manifest.leaderEpoch) && manifest.leaderEpoch >= 0 ? manifest.leaderEpoch : 0,
     advertisedHostname: typeof manifest.advertisedHostname === "string" ? manifest.advertisedHostname : "",
-    wssUrl,
+    websocketUrl,
+    wssUrl: websocketUrl,
     fallbackServers: Array.isArray(manifest.fallbackServers)
       ? manifest.fallbackServers
-        .map(normalizeBrowserConnectServer)
+        .filter(server => typeof server === "string")
+        .map(server => server.trim())
         .filter(Boolean)
       : [],
     backboneRttMs: isPositiveFiniteNumber(manifest.backboneRttMs) || manifest.backboneRttMs === 0
       ? manifest.backboneRttMs
       : null,
-    discoveryUrl:
-      typeof manifest.discoveryUrl === "string" && manifest.discoveryUrl.trim() !== ""
-        ? manifest.discoveryUrl
-        : undefined,
+    discoveryUrl,
     leaseExpiresAt:
       typeof manifest.leaseExpiresAt === "string" && manifest.leaseExpiresAt.trim() !== ""
         ? manifest.leaseExpiresAt
+        : undefined,
+    nodeId:
+      typeof manifest.nodeId === "string" && manifest.nodeId.trim() !== ""
+        ? manifest.nodeId
+        : undefined,
+    discoveryNamespace:
+      typeof manifest.discoveryNamespace === "string" && manifest.discoveryNamespace.trim() !== ""
+        ? manifest.discoveryNamespace
+        : undefined,
+    isLeader: manifest.isLeader === undefined ? undefined : Boolean(manifest.isLeader),
+    candidateRole:
+      manifest.candidateRole === "leader" ||
+      manifest.candidateRole === "follower" ||
+      manifest.candidateRole === "candidate" ||
+      manifest.candidateRole === "stopped"
+        ? manifest.candidateRole
         : undefined,
   };
 }
@@ -132,6 +233,11 @@ export class KinopioHub {
   #discoveryProbePromise = null;
   #discoveryManifestCache = null;
   #discoveryManifestCacheExpiresAt = 0;
+  #autoLeafHandle = null;
+  #autoLeafStartupPromise = null;
+  #autoLeafMonitorTimer = null;
+  #autoLeafDiscoveryManifestUrl = null;
+  #autoLeafDiscoveryNamespace = null;
   
   /**
    * Creates a new KinopioHub instance
@@ -151,17 +257,28 @@ export class KinopioHub {
    * @param {number} [options.retryDelay=1000] - Initial retry delay in ms
    * @param {number} [options.maxRetryDelay=30000] - Maximum retry delay in ms
    * @param {number} [options.retryBackoffFactor=1.5] - Backoff multiplier for retry delays
-   * @param {Object} [options.discovery] - Browser-side local leaf discovery controls
-   * @param {boolean} [options.discovery.enabled] - Enable the browser-side local leaf enhancement path
-   * @param {string} [options.discovery.manifestUrl] - Override the discovery manifest URL used by the browser-side local probe flow
+   * @param {Object|false} [options.discovery] - Local leaf discovery controls
+   * @param {boolean} [options.discovery.enabled=true] - Enable local leaf discovery and hot-switching
+   * @param {string} [options.discovery.manifestUrl] - Override the discovery manifest URL used by the local probe flow
    * @param {boolean} [options.discovery.backgroundLocalProbe=true] - Keep probing in the background after the initial remote connection is ready
-   * @param {number} [options.discovery.localSwitchTimeoutMs=1500] - Timeout for switching the current browser session to a discovered local leaf
-   * @param {number} [options.discovery.cacheTtlMs=5000] - Cache TTL for browser-side manifest reuse and re-probe cadence
+   * @param {number} [options.discovery.localSwitchTimeoutMs=1500] - Timeout for switching the current session to a discovered local leaf
+   * @param {number} [options.discovery.cacheTtlMs=5000] - Cache TTL for discovery manifest reuse and re-probe cadence
+   * @param {boolean|Object} [options.autoLeaf] - Auto-start a local leaf in non-browser Node runtimes; set `false` to disable startup
+   * @param {boolean} [options.autoLeaf.enabled=true] - Enable non-browser auto leaf startup
+   * @param {string} [options.autoLeaf.discoveryNamespace="local"] - Discovery namespace used by the auto-started local leaf
+   * @param {boolean} [options.autoLeaf.webSocketTls=false] - Expose the auto-started local leaf over WSS (true) or WS (false)
    * @param {Object} [options.codec] - Custom codec with encode(data) and decode(bytes)
    * @param {Function} [options.jsonReplacer] - JSON.stringify replacer
    * @param {Function} [options.jsonReviver] - JSON.parse reviver
    */
   constructor(options = {}) {
+    const resolvedDiscovery = options.discovery === undefined
+      ? { enabled: true }
+      : options.discovery;
+    const resolvedAutoLeaf = options.autoLeaf === undefined
+      ? { enabled: true, discoveryNamespace: "local", webSocketTls: false }
+      : options.autoLeaf;
+
     // Default connection options
     this.#options = {
       debug: false,
@@ -182,11 +299,14 @@ export class KinopioHub {
       retryDelay: 1000,
       maxRetryDelay: 30000,
       retryBackoffFactor: 1.5,
-      discovery: undefined,
+      discovery: resolvedDiscovery,
+      autoLeaf: resolvedAutoLeaf,
       jsonReplacer: undefined,
       jsonReviver: undefined,
       codec: undefined,
       ...options,
+      discovery: resolvedDiscovery,
+      autoLeaf: resolvedAutoLeaf,
     };
 
     // Environment detection
@@ -198,6 +318,8 @@ export class KinopioHub {
     this.state = "disconnected";
     this.isConnected = false;
     this.debug = this.#options.debug;
+
+    void this.#initAutoLeaf();
     
     // Start connection
     if (this.#options.autoConnect !== false) {
@@ -294,23 +416,43 @@ export class KinopioHub {
     this.#discoveryManifestCacheExpiresAt = 0;
   }
 
+  #clearAutoLeafMonitorTimer() {
+    if (!this.#autoLeafMonitorTimer) return;
+    clearTimeout(this.#autoLeafMonitorTimer);
+    this.#autoLeafMonitorTimer = null;
+  }
+
   #resolveDiscoveryOptions() {
     const discovery = this.#options.discovery;
-    if (!this.isBrowser || !isPlainObject(discovery) || discovery.enabled !== true) {
+    if (discovery === false) {
+      return null;
+    }
+
+    const discoveryOptions = isPlainObject(discovery) ? discovery : {};
+    if (discoveryOptions.enabled === false) {
       return null;
     }
 
     let manifestUrl = null;
 
-    if (typeof discovery.manifestUrl === "string" && discovery.manifestUrl.trim() !== "") {
+    if (typeof discoveryOptions.manifestUrl === "string" && discoveryOptions.manifestUrl.trim() !== "") {
       try {
-        manifestUrl = new URL(discovery.manifestUrl.trim(), globalThis.window?.location?.href).toString();
+        const baseUrl = this.isBrowser ? globalThis.window?.location?.href : undefined;
+        manifestUrl = normalizeDiscoveryEndpointUrl(
+          new URL(discoveryOptions.manifestUrl.trim(), baseUrl).toString(),
+          "options.discovery.manifestUrl",
+        );
       } catch {
         manifestUrl = null;
       }
-    } else {
+    } else if (this.#autoLeafDiscoveryManifestUrl) {
+      manifestUrl = this.#autoLeafDiscoveryManifestUrl;
+    } else if (this.isBrowser) {
       try {
-        manifestUrl = new URL(DEFAULT_DISCOVERY_MANIFEST_PATH, globalThis.window?.location?.href).toString();
+        manifestUrl = normalizeDiscoveryEndpointUrl(
+          new URL(DEFAULT_DISCOVERY_MANIFEST_PATH, globalThis.window?.location?.href).toString(),
+          "default discovery manifest URL",
+        );
       } catch {
         manifestUrl = null;
       }
@@ -322,14 +464,175 @@ export class KinopioHub {
 
     return {
       manifestUrl,
-      backgroundLocalProbe: discovery.backgroundLocalProbe !== false,
-      localSwitchTimeoutMs: isPositiveFiniteNumber(discovery.localSwitchTimeoutMs)
-        ? Math.floor(discovery.localSwitchTimeoutMs)
+      backgroundLocalProbe: discoveryOptions.backgroundLocalProbe !== false,
+      localSwitchTimeoutMs: isPositiveFiniteNumber(discoveryOptions.localSwitchTimeoutMs)
+        ? Math.floor(discoveryOptions.localSwitchTimeoutMs)
         : DEFAULT_LOCAL_SWITCH_TIMEOUT_MS,
-      cacheTtlMs: isPositiveFiniteNumber(discovery.cacheTtlMs)
-        ? Math.floor(discovery.cacheTtlMs)
+      cacheTtlMs: isPositiveFiniteNumber(discoveryOptions.cacheTtlMs)
+        ? Math.floor(discoveryOptions.cacheTtlMs)
         : DEFAULT_DISCOVERY_CACHE_TTL_MS,
     };
+  }
+
+  #resolveAutoLeafOptions() {
+    if (this.isBrowser || !isNodeRuntime()) {
+      return null;
+    }
+
+    const autoLeaf = this.#options.autoLeaf;
+    if (autoLeaf === false) {
+      return null;
+    }
+
+    if (autoLeaf === true || autoLeaf === undefined) {
+      return {
+        enabled: true,
+        discoveryNamespace: "local",
+        webSocketTls: false,
+      };
+    }
+
+    if (!isPlainObject(autoLeaf)) {
+      return null;
+    }
+
+    if (autoLeaf.enabled === false) {
+      return null;
+    }
+
+    return {
+      ...autoLeaf,
+      enabled: true,
+      discoveryNamespace:
+        typeof autoLeaf.discoveryNamespace === "string" && autoLeaf.discoveryNamespace.trim() !== ""
+          ? autoLeaf.discoveryNamespace.trim()
+          : "local",
+      webSocketTls: autoLeaf.webSocketTls === true,
+    };
+  }
+
+  #readAutoLeafDiscoveryManifestUrl() {
+    const status = this.#autoLeafHandle?.status?.();
+    const manifestUrl =
+      status?.localLeaf?.manifest?.discoveryUrl ||
+      status?.leader?.discoveryUrl ||
+      null;
+
+    return typeof manifestUrl === "string" && manifestUrl.trim() !== ""
+      ? normalizeDiscoveryEndpointUrl(manifestUrl, "auto leaf discovery manifest URL")
+      : null;
+  }
+
+  async #refreshAutoLeafDiscoveryState() {
+    if (!this.#autoLeafHandle) {
+      this.#autoLeafDiscoveryManifestUrl = null;
+      this.#autoLeafDiscoveryNamespace = null;
+      return;
+    }
+
+    const status = this.#autoLeafHandle.status?.();
+    const nextManifestUrl = this.#readAutoLeafDiscoveryManifestUrl();
+    const nextNamespace =
+      status?.localLeaf?.manifest?.discoveryNamespace ||
+      status?.leader?.discoveryNamespace ||
+      status?.discoveryNamespace ||
+      null;
+    const manifestChanged = nextManifestUrl !== this.#autoLeafDiscoveryManifestUrl;
+    const namespaceChanged = nextNamespace !== this.#autoLeafDiscoveryNamespace;
+
+    this.#autoLeafDiscoveryManifestUrl = nextManifestUrl;
+    this.#autoLeafDiscoveryNamespace =
+      typeof nextNamespace === "string" && nextNamespace.trim() !== ""
+        ? nextNamespace
+        : null;
+
+    if (manifestChanged || namespaceChanged) {
+      this.#clearDiscoveryManifestCache();
+      if (this.#activeConnection && this.state === "connected") {
+        this.#scheduleDiscoveryProbeCycle(0);
+      }
+    }
+  }
+
+  #scheduleAutoLeafMonitor(delayMs = 250) {
+    this.#clearAutoLeafMonitorTimer();
+    if (!this.#autoLeafHandle) {
+      return;
+    }
+
+    this.#autoLeafMonitorTimer = setTimeout(() => {
+      this.#autoLeafMonitorTimer = null;
+      this.#refreshAutoLeafDiscoveryState()
+        .catch(error => {
+          this.#log("warn", "Failed to refresh auto leaf discovery state:", error);
+        })
+        .finally(() => {
+          if (this.#autoLeafHandle) {
+            this.#scheduleAutoLeafMonitor(delayMs);
+          }
+        });
+    }, Math.max(0, delayMs));
+    this.#autoLeafMonitorTimer.unref?.();
+  }
+
+  async #initAutoLeaf() {
+    const autoLeafOptions = this.#resolveAutoLeafOptions();
+    if (!autoLeafOptions || this.#autoLeafStartupPromise || this.#autoLeafHandle) {
+      return this.#autoLeafHandle;
+    }
+
+    let startupPromise;
+    startupPromise = (async () => {
+      const { enableAutoLeaf } = await importLeafEntrypoint();
+      const handle = await enableAutoLeaf(autoLeafOptions);
+      if (this.#autoLeafStartupPromise === startupPromise) {
+        this.#autoLeafHandle = handle;
+        await this.#refreshAutoLeafDiscoveryState();
+        this.#scheduleAutoLeafMonitor();
+      }
+      this.#log("info", "Auto leaf started for this Node runtime", {
+        discoveryNamespace: autoLeafOptions.discoveryNamespace,
+        webSocketTls: autoLeafOptions.webSocketTls !== false,
+      });
+      return handle;
+    })();
+
+    this.#autoLeafStartupPromise = startupPromise;
+
+    try {
+      return await startupPromise;
+    } catch (error) {
+      this.#log("warn", "Auto leaf startup failed; continuing without a local leaf", error);
+      return null;
+    } finally {
+      if (this.#autoLeafStartupPromise === startupPromise) {
+        this.#autoLeafStartupPromise = null;
+      }
+    }
+  }
+
+  async #disposeAutoLeaf() {
+    this.#clearAutoLeafMonitorTimer();
+
+    let handle = this.#autoLeafHandle;
+    this.#autoLeafHandle = null;
+    this.#autoLeafDiscoveryManifestUrl = null;
+    this.#autoLeafDiscoveryNamespace = null;
+
+    const startupPromise = this.#autoLeafStartupPromise;
+    this.#autoLeafStartupPromise = null;
+
+    if (!handle && startupPromise) {
+      try {
+        handle = await startupPromise;
+      } catch {
+        handle = null;
+      }
+    }
+
+    if (handle?.stop) {
+      await handle.stop();
+    }
   }
 
   #createBaseConnectOptions() {
@@ -342,6 +645,7 @@ export class KinopioHub {
       retryBackoffFactor,
       healthReport,
       discovery,
+      autoLeaf,
       codec,
       jsonReplacer,
       jsonReviver,
@@ -373,11 +677,13 @@ export class KinopioHub {
   }
 
   #normalizeServerCandidates(servers = this.#options.servers) {
-    const inputServers = Array.isArray(servers) ? servers : [servers];
-    const candidates = inputServers
-      .filter(server => typeof server === "string")
-      .map(server => server.trim())
-      .filter(Boolean);
+    const inputServers =
+      servers == null
+        ? []
+        : Array.isArray(servers)
+          ? servers
+          : [servers];
+    const candidates = inputServers.map((server, index) => normalizeClientConnectServer(server, `options.servers[${index}]`));
 
     return candidates.length > 0 ? candidates : [...DEFAULT_SERVERS];
   }
@@ -597,7 +903,7 @@ export class KinopioHub {
     }
 
     const currentServer = this.#activeConnection.getServer?.() ?? connectionPlan.connectedServer ?? null;
-    return currentServer === connectionPlan.discoveryLocalServer;
+    return serversMatch(currentServer, connectionPlan.discoveryLocalServer);
   }
 
   #scheduleLatencyProbeCycle() {
@@ -763,11 +1069,11 @@ export class KinopioHub {
   #buildDiscoveryPreferredPlan(localServer, manifest, basePlan, manifestUrl) {
     const remoteSourceCandidates = uniqueServers(
       (basePlan?.sourceCandidates || this.#normalizeServerCandidates())
-        .filter(server => server !== localServer),
+        .filter(server => !serversMatch(server, localServer)),
     );
     const remoteOrderedCandidates = uniqueServers(
       (basePlan?.orderedCandidates || remoteSourceCandidates)
-        .filter(server => server !== localServer),
+        .filter(server => !serversMatch(server, localServer)),
     );
 
     return {
@@ -790,7 +1096,7 @@ export class KinopioHub {
     const currentPlan = this.#activeConnectionPlan;
     const currentServer = this.#activeConnection?.getServer?.() ?? currentPlan?.connectedServer ?? null;
 
-    if (!currentPlan?.discoveryLocalServer || currentServer !== currentPlan.discoveryLocalServer) {
+    if (!currentPlan?.discoveryLocalServer || !serversMatch(currentServer, currentPlan.discoveryLocalServer)) {
       return false;
     }
 
@@ -814,12 +1120,12 @@ export class KinopioHub {
       return await this.#switchToRemoteDiscoveryFallback(discoveryOptions, "no usable local leader manifest");
     }
 
-    const localServer = manifest.wssUrl;
+    const localServer = manifest.websocketUrl || manifest.wssUrl;
     if (!localServer) {
-      return await this.#switchToRemoteDiscoveryFallback(discoveryOptions, "manifest did not expose a usable wssUrl");
+      return await this.#switchToRemoteDiscoveryFallback(discoveryOptions, "manifest did not expose a usable websocketUrl");
     }
 
-    if (currentPlan?.discoveryLocalServer === localServer && currentServer === localServer) {
+    if (serversMatch(currentPlan?.discoveryLocalServer, localServer) && serversMatch(currentServer, localServer)) {
       currentPlan.discoveryManifest = manifest;
       currentPlan.discoveryManifestUrl = discoveryOptions.manifestUrl;
       return false;
@@ -837,8 +1143,10 @@ export class KinopioHub {
         timeoutMs: discoveryOptions.localSwitchTimeoutMs,
         expectedServer: localServer,
       });
-      this.#log("info", "Background local leaf probe switched the current session to a discovered local leaf", {
+      this.#log("info", "Connected to local Kinopio leaf", {
+        from: currentServer,
         to: localServer,
+        discoveryNamespace: manifest.discoveryNamespace || this.#autoLeafDiscoveryNamespace || null,
         manifestUrl: discoveryOptions.manifestUrl,
       });
       return true;
@@ -961,7 +1269,7 @@ export class KinopioHub {
       await candidateConnection.flush();
 
       connectionPlan.connectedServer = candidateConnection.getServer?.() ?? connectionPlan.orderedCandidates[0];
-      if (expectedServer && connectionPlan.connectedServer !== expectedServer) {
+      if (expectedServer && !serversMatch(connectionPlan.connectedServer, expectedServer)) {
         throw new Error(
           `Expected discovery switch to connect ${expectedServer}, but the candidate connection settled on ${connectionPlan.connectedServer}`,
         );
@@ -1482,6 +1790,7 @@ export class KinopioHub {
     this.#scopes.clear();
     
     await this.#cleanup();
+    await this.#disposeAutoLeaf();
   }
 }
 

@@ -88,6 +88,13 @@ function assertOptionalPositiveNumber(value, label) {
   }
 }
 
+function assertOptionalBoolean(value, label) {
+  if (value === undefined) return;
+  if (typeof value !== "boolean") {
+    throw new TypeError(`${label} must be a boolean`);
+  }
+}
+
 function assertOptionalPort(value, label) {
   if (value === undefined) return;
   if (!Number.isInteger(value) || value < 1 || value > 65535) {
@@ -123,6 +130,7 @@ function validateLeafNodeOptions(options, label = "options") {
   assertOptionalString(options.binaryPath, `${label}.binaryPath`);
   assertOptionalString(options.runtimeDir, `${label}.runtimeDir`);
   assertOptionalString(options.lanBindAddress, `${label}.lanBindAddress`);
+  assertOptionalBoolean(options.webSocketTls, `${label}.webSocketTls`);
 
   if (options.ports !== undefined) {
     assertPlainObject(options.ports, `${label}.ports`);
@@ -280,18 +288,23 @@ async function resolveStableNodeId(customCacheDir, explicitNodeId) {
 
 function resolveBackboneProbeTarget(url) {
   const parsed = new URL(url);
-  const port = parsed.port
-    ? Number(parsed.port)
-    : parsed.protocol === "ws:"
-      ? 80
-      : parsed.protocol === "nats-leaf:"
-        ? 7_422
-      : 4_222;
+  let port = parsed.port ? Number(parsed.port) : 4_222;
+  if (!parsed.port && parsed.protocol === "ws:") {
+    port = 80;
+  } else if (!parsed.port && parsed.protocol === "wss:") {
+    port = 443;
+  } else if (!parsed.port && (parsed.protocol === "nats-leaf:" || parsed.protocol === "tls:")) {
+    port = 7_422;
+  }
 
   return {
     host: parsed.hostname,
     port,
   };
+}
+
+function isWebSocketTlsEnabled(options) {
+  return options.webSocketTls !== false;
 }
 
 async function measureTcpConnectRtt({ host, port }, timeoutMs = 1_500) {
@@ -466,7 +479,34 @@ function quoteConfigValue(value) {
   return JSON.stringify(String(value));
 }
 
-function renderLeafConfig({ paths, ports, lanBindAddress, advertisedHostname, normalizedBackboneServers }) {
+function getBackboneTransportMode(url) {
+  const protocol = new URL(url).protocol;
+  if (protocol === "ws:") return "websocket";
+  if (protocol === "wss:") return "websocket-tls";
+  return "leafnode";
+}
+
+function assertCompatibleBackboneServers(backboneServers) {
+  const modes = new Set(backboneServers.map(getBackboneTransportMode));
+  if (modes.size <= 1) {
+    return;
+  }
+
+  throw new TypeError(
+    "backboneServers must use one remote transport mode per leaf runtime. " +
+    "Do not mix ws://, wss://, and native leafnode URLs in the same list.",
+  );
+}
+
+function renderBackboneRemoteUrl(url) {
+  const parsed = new URL(url);
+  if (parsed.protocol === "wss:") {
+    parsed.protocol = "ws:";
+  }
+  return parsed.toString();
+}
+
+function renderLeafConfig({ paths, ports, lanBindAddress, advertisedHostname, normalizedBackboneServers, webSocketTls }) {
   const lines = [
     `listen: ${quoteConfigValue(`127.0.0.1:${ports.client}`)}`,
     `http: ${quoteConfigValue(`127.0.0.1:${ports.monitor}`)}`,
@@ -477,21 +517,31 @@ function renderLeafConfig({ paths, ports, lanBindAddress, advertisedHostname, no
     `  host: ${quoteConfigValue(lanBindAddress)}`,
     `  port: ${ports.websocket}`,
     `  advertise: ${quoteConfigValue(`${advertisedHostname}:${ports.websocket}`)}`,
-    "  tls {",
-    `    cert_file: ${quoteConfigValue(paths.certFile)}`,
-    `    key_file: ${quoteConfigValue(paths.keyFile)}`,
-    "  }",
+    ...(webSocketTls
+      ? [
+          "  tls {",
+          `    cert_file: ${quoteConfigValue(paths.certFile)}`,
+          `    key_file: ${quoteConfigValue(paths.keyFile)}`,
+          "  }",
+        ]
+      : [
+          "  no_tls: true",
+        ]),
     "}",
   ];
 
   if (normalizedBackboneServers.length > 0) {
+    const needsRemoteTls = normalizedBackboneServers.every(url => getBackboneTransportMode(url) === "websocket-tls");
+    const remoteUrls = normalizedBackboneServers.map(renderBackboneRemoteUrl);
+
     lines.push(
       "",
       "leafnodes {",
       "  remotes: [",
       "    {",
-      `      urls: [${normalizedBackboneServers.map(url => quoteConfigValue(url)).join(", ")}]`,
+      `      urls: [${remoteUrls.map(url => quoteConfigValue(url)).join(", ")}]`,
       "      no_randomize: true",
+      ...(needsRemoteTls ? ["      tls {}"] : []),
       "    }",
       "  ]",
       "  reconnect: 2",
@@ -805,6 +855,27 @@ async function maybeInstallGeneratedCaTrust(securityPaths, caCertFile) {
 }
 
 async function ensureTlsFiles(options, runtimePaths, advertisedHostname, lanBindAddress) {
+  if (!isWebSocketTlsEnabled(options)) {
+    if (options.tls?.certFile || options.tls?.keyFile) {
+      throw new Error("options.tls.certFile/keyFile cannot be used when options.webSocketTls is false");
+    }
+
+    return {
+      certFile: null,
+      keyFile: null,
+      generated: false,
+      caCertFile: null,
+      trustStatus: buildTrustStatus({
+        state: "skipped",
+        strategy: "no-tls",
+        detail: "Local WebSocket TLS is disabled via options.webSocketTls=false.",
+        attempted: false,
+        requiresUserAction: false,
+      }),
+      mode: "disabled",
+    };
+  }
+
   if (options.tls?.certFile || options.tls?.keyFile) {
     if (!options.tls?.certFile || !options.tls?.keyFile) {
       throw new Error("options.tls.certFile and options.tls.keyFile must be provided together");
@@ -1000,17 +1071,43 @@ async function probeTlsListener(host, port) {
   });
 }
 
+async function probeTcpListener(host, port) {
+  await new Promise((resolve, reject) => {
+    const socket = net.createConnection({ host, port });
+
+    const timeout = setTimeout(() => {
+      socket.destroy();
+      reject(new Error("Timed out waiting for the local WS listener"));
+    }, 2_000);
+
+    socket.once("connect", () => {
+      clearTimeout(timeout);
+      socket.end();
+      resolve();
+    });
+    socket.once("error", (error) => {
+      clearTimeout(timeout);
+      reject(error);
+    });
+  });
+}
+
 async function probeDiscoveryEndpoint(discoveryUrl) {
   await new Promise((resolve, reject) => {
     const url = new URL(discoveryUrl);
-    const request = https.get(
-      {
-        hostname: url.hostname,
-        port: url.port,
-        path: url.pathname,
-        rejectUnauthorized: false,
-        servername: isIpv4Address(url.hostname) ? undefined : url.hostname,
-      },
+    const requestOptions = {
+      hostname: url.hostname,
+      port: url.port,
+      path: url.pathname,
+    };
+    const client = url.protocol === "https:" ? https : http;
+    if (url.protocol === "https:") {
+      requestOptions.rejectUnauthorized = false;
+      requestOptions.servername = isIpv4Address(url.hostname) ? undefined : url.hostname;
+    }
+
+    const request = client.get(
+      requestOptions,
       (response) => {
         const chunks = [];
         response.setEncoding("utf8");
@@ -1073,7 +1170,18 @@ function createPeerRecordFromPayload(payload, receivedAt = Date.now()) {
           : new Date(receivedAt + DEFAULT_DISCOVERY_MANIFEST_TTL_MS).toISOString(),
     leaderEpoch: normalizeEpoch(payload.leaderEpoch),
     advertisedHostname: typeof payload.advertisedHostname === "string" ? payload.advertisedHostname : "",
-    wssUrl: typeof payload.wssUrl === "string" ? payload.wssUrl : "",
+    websocketUrl:
+      typeof payload.websocketUrl === "string"
+        ? payload.websocketUrl
+        : typeof payload.wssUrl === "string"
+          ? payload.wssUrl
+          : "",
+    wssUrl:
+      typeof payload.wssUrl === "string"
+        ? payload.wssUrl
+        : typeof payload.websocketUrl === "string"
+          ? payload.websocketUrl
+          : "",
     discoveryUrl: typeof payload.discoveryUrl === "string" ? payload.discoveryUrl : "",
     fallbackServers: normalizeStringArray(payload.fallbackServers),
     backboneRttMs: normalizeFiniteRtt(payload.backboneRttMs),
@@ -1119,7 +1227,8 @@ function mergePeerRecords(existing, next) {
     expiresAt: preferred.expiresAt || fallback.expiresAt || "",
     leaderEpoch: Math.max(normalizeEpoch(existing.leaderEpoch), normalizeEpoch(next.leaderEpoch)),
     advertisedHostname: preferred.advertisedHostname || fallback.advertisedHostname || "",
-    wssUrl: preferred.wssUrl || fallback.wssUrl || "",
+    websocketUrl: preferred.websocketUrl || fallback.websocketUrl || preferred.wssUrl || fallback.wssUrl || "",
+    wssUrl: preferred.wssUrl || fallback.wssUrl || preferred.websocketUrl || fallback.websocketUrl || "",
     discoveryUrl: preferred.discoveryUrl || fallback.discoveryUrl || "",
     fallbackServers: preferredFallbackServers.length > 0 ? preferredFallbackServers : fallbackFallbackServers,
     backboneRttMs:
@@ -1144,7 +1253,8 @@ function toPublicManifest(record) {
     expiresAt: record.expiresAt || record.leaseExpiresAt || new Date(Date.now() + DEFAULT_DISCOVERY_MANIFEST_TTL_MS).toISOString(),
     leaderEpoch: normalizeEpoch(record.leaderEpoch),
     advertisedHostname: record.advertisedHostname || "",
-    wssUrl: record.wssUrl || "",
+    websocketUrl: record.websocketUrl || record.wssUrl || "",
+    wssUrl: record.wssUrl || record.websocketUrl || "",
     discoveryUrl: record.discoveryUrl || undefined,
     fallbackServers: normalizeStringArray(record.fallbackServers),
     backboneRttMs: normalizeFiniteRtt(record.backboneRttMs),
@@ -1194,7 +1304,8 @@ function buildSelfPresenceRecord(agent, now = Date.now(), candidateRole = mapAut
     expiresAt: new Date(now + DEFAULT_DISCOVERY_MANIFEST_TTL_MS).toISOString(),
     leaderEpoch: normalizeEpoch(agent.localLeaderEpoch),
     advertisedHostname: agent.advertisedHostname,
-    wssUrl: localLeaderRecord?.wssUrl || "",
+    websocketUrl: localLeaderRecord?.websocketUrl || localLeaderRecord?.wssUrl || "",
+    wssUrl: localLeaderRecord?.wssUrl || localLeaderRecord?.websocketUrl || "",
     discoveryUrl: localLeaderRecord?.discoveryUrl || "",
     fallbackServers: [...agent.normalizedBackboneServers],
     backboneRttMs: normalizeFiniteRtt(agent.backboneRttMs),
@@ -1261,6 +1372,19 @@ function readPortFromUrl(url) {
     : null;
 
   return parsed.port ? Number(parsed.port) : fallbackPort;
+}
+
+function readProtocolNameFromUrl(url, fallback = "") {
+  if (typeof url !== "string" || url.trim() === "") {
+    return fallback;
+  }
+
+  try {
+    const parsed = new URL(url);
+    return parsed.protocol.replace(/:$/u, "") || fallback;
+  } catch {
+    return fallback;
+  }
 }
 
 function noteObservedEpoch(agent, record) {
@@ -1376,7 +1500,9 @@ async function broadcastMdnsAnnouncement(agent) {
       advertisedHostname: leaderRecord.advertisedHostname,
       advertisedAddress: agent.lanBindAddress,
       discoveryPort: readPortFromUrl(leaderRecord.discoveryUrl),
-      websocketPort: readPortFromUrl(leaderRecord.wssUrl),
+      websocketPort: readPortFromUrl(leaderRecord.websocketUrl || leaderRecord.wssUrl),
+      websocketProtocol: readProtocolNameFromUrl(leaderRecord.websocketUrl || leaderRecord.wssUrl, "wss"),
+      discoveryProtocol: readProtocolNameFromUrl(leaderRecord.discoveryUrl, "https"),
       leaderEpoch: normalizeEpoch(leaderRecord.leaderEpoch),
       leaseExpiresAt: leaderRecord.leaseExpiresAt || makeLeaseExpiresAt(),
       backboneRttMs: normalizeFiniteRtt(leaderRecord.backboneRttMs),
@@ -1663,6 +1789,7 @@ function createDiscoveryManifest(state) {
     expiresAt: leaseExpiresAt || new Date(Date.now() + DEFAULT_DISCOVERY_MANIFEST_TTL_MS).toISOString(),
     leaderEpoch: normalizeEpoch(state.manifestState.leaderEpoch),
     advertisedHostname: state.advertisedHostname,
+    websocketUrl: state.websocketUrl,
     wssUrl: state.wssUrl,
     discoveryUrl: state.discoveryUrl,
     fallbackServers: [...state.backboneServers],
@@ -1679,6 +1806,9 @@ function snapshotState(state) {
   return Object.freeze({
     phase: state.phase,
     bridgeState: state.bridgeState,
+    websocketUrl: state.websocketUrl,
+    wssUrl: state.wssUrl,
+    discoveryUrl: state.discoveryUrl,
     clientUrl: state.clientUrl,
     monitorUrl: state.monitorUrl,
     runtimeVersion: NATS_SERVER_VERSION,
@@ -1716,13 +1846,18 @@ function pushOutputLine(state, prefix, content) {
 }
 
 async function startDiscoveryServer(state, tlsMaterial) {
-  state.discoveryServer = https.createServer(
-    {
-      cert: await readFile(tlsMaterial.certFile),
-      key: await readFile(tlsMaterial.keyFile),
-    },
+  const serverFactory = state.webSocketTls ? https.createServer : http.createServer;
+  const serverOptions = state.webSocketTls
+    ? {
+        cert: await readFile(tlsMaterial.certFile),
+        key: await readFile(tlsMaterial.keyFile),
+      }
+    : undefined;
+
+  state.discoveryServer = serverFactory(
+    serverOptions,
     (request, response) => {
-      const requestPath = new URL(request.url || "/", `https://${state.advertisedHostname}`).pathname;
+      const requestPath = new URL(request.url || "/", state.discoveryUrl).pathname;
       if (requestPath !== WELL_KNOWN_MANIFEST_PATH) {
         response.statusCode = 404;
         response.setHeader("content-type", "application/json; charset=utf-8");
@@ -1787,8 +1922,10 @@ async function waitForLeafRuntimeReady(state, startupErrorRef) {
       await Promise.all([
         probeMonitorHealth(state.monitorUrl),
         probeNatsClient(state.ports.client),
-        probeTlsListener(state.lanBindAddress, state.ports.websocket),
-        probeDiscoveryEndpoint(`https://${state.lanBindAddress}:${state.ports.discovery}${WELL_KNOWN_MANIFEST_PATH}`),
+        state.webSocketTls
+          ? probeTlsListener(state.lanBindAddress, state.ports.websocket)
+          : probeTcpListener(state.lanBindAddress, state.ports.websocket),
+        probeDiscoveryEndpoint(state.discoveryUrl),
       ]);
       await refreshBridgeState(state);
       return;
@@ -1826,6 +1963,8 @@ export async function startLeafNode(options) {
   validateLeafNodeOptions(options);
 
   const normalizedBackboneServers = (options.backboneServers || []).map(normalizeBackboneServerUrl);
+  assertCompatibleBackboneServers(normalizedBackboneServers);
+  const webSocketTls = isWebSocketTlsEnabled(options);
   const lanBindAddress = chooseLanAddress(options.lanBindAddress);
   const advertisedHostname = options.advertisedHostname || lanBindAddress;
   const { binaryPath } = await ensureNatsServerBinary({
@@ -1849,6 +1988,7 @@ export async function startLeafNode(options) {
     lanBindAddress,
     advertisedHostname,
     normalizedBackboneServers,
+    webSocketTls,
   });
   await writeFile(runtimePaths.configFile, configContents, "utf8");
 
@@ -1867,10 +2007,12 @@ export async function startLeafNode(options) {
     pidFile: runtimePaths.pidFile,
     storeDir: runtimePaths.storeDir,
     ports,
+    webSocketTls,
+    websocketUrl: `${webSocketTls ? "wss" : "ws"}://${advertisedHostname}:${ports.websocket}`,
     clientUrl: `nats://127.0.0.1:${ports.client}`,
     monitorUrl: `http://127.0.0.1:${ports.monitor}`,
-    wssUrl: `wss://${advertisedHostname}:${ports.websocket}`,
-    discoveryUrl: `https://${advertisedHostname}:${ports.discovery}${WELL_KNOWN_MANIFEST_PATH}`,
+    wssUrl: `${webSocketTls ? "wss" : "ws"}://${advertisedHostname}:${ports.websocket}`,
+    discoveryUrl: `${webSocketTls ? "https" : "http"}://${advertisedHostname}:${ports.discovery}${WELL_KNOWN_MANIFEST_PATH}`,
     processId: null,
     processExitCode: null,
     lastError: null,
@@ -1941,6 +2083,7 @@ export async function startLeafNode(options) {
     state.backgroundPollTimer.unref?.();
 
     return {
+      websocketUrl: state.websocketUrl,
       wssUrl: state.wssUrl,
       discoveryUrl: state.discoveryUrl,
       advertisedHostname: state.advertisedHostname,
@@ -1996,6 +2139,7 @@ export async function enableAutoLeaf(options) {
   validateAutoLeafOptions(options);
 
   const normalizedBackboneServers = (options.backboneServers || []).map(normalizeBackboneServerUrl);
+  assertCompatibleBackboneServers(normalizedBackboneServers);
   const leaderMissingGraceMs = options.leaderMissingGraceMs || DEFAULT_LEADER_MISSING_GRACE_MS;
   const lanBindAddress = chooseLanAddress(options.lanBindAddress);
   const advertisedHostname = options.advertisedHostname || lanBindAddress;

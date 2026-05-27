@@ -12,6 +12,7 @@ export interface LeafDiscoveryManifest {
   expiresAt: string;
   leaderEpoch: number;
   advertisedHostname: string;
+  websocketUrl: string;
   wssUrl: string;
   fallbackServers: string[];
   backboneRttMs: number | null;
@@ -38,6 +39,7 @@ export interface LeafNodeTlsOptions {
 export interface LeafNodeOptions {
   discoveryNamespace: string;
   backboneServers?: string[];
+  webSocketTls?: boolean;
   advertisedHostname?: string;
   nodeId?: string;
   cacheDir?: string;
@@ -62,13 +64,14 @@ export interface LeafTrustStatus {
 }
 
 export interface LeafTlsStatus {
-  mode: "external" | "generated-ca";
-  certFile: string;
+  mode: "external" | "generated-ca" | "disabled";
+  certFile: string | null;
   caCertFile: string | null;
   trust: LeafTrustStatus;
 }
 
 export interface LeafNodeHandle {
+  readonly websocketUrl: string;
   readonly wssUrl: string;
   readonly discoveryUrl: string;
   readonly advertisedHostname: string;
@@ -77,6 +80,9 @@ export interface LeafNodeHandle {
   status(): Readonly<{
     phase: "starting" | "ready" | "stopping" | "stopped" | "error";
     bridgeState: "connecting" | "connected" | "disconnected" | "error";
+    websocketUrl: string;
+    wssUrl: string;
+    discoveryUrl: string;
     clientUrl: string;
     monitorUrl: string;
     runtimeVersion: string;

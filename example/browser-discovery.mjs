@@ -1,20 +1,21 @@
-import KinopioHub from "../kinopio.mjs";
+import { DEMO_SERVER, createDemoHub, delay } from "./_shared.mjs";
 
-console.log("=== KinopioHub Browser Discovery Example ===");
-
-const hub = new KinopioHub({
-  autoConnect: false,
-  serverSelectionMode: "ordered",
-  servers: ["wss://remote.example.com:443"],
+const hub = createDemoHub({
   discovery: {
     enabled: true,
-    manifestUrl: "https://app.example.com/.well-known/kinopio-leader.json",
+    manifestUrl: "http://127.0.0.1:1/.well-known/kinopio-leader.json",
     backgroundLocalProbe: true,
-    localSwitchTimeoutMs: 1_500,
-    cacheTtlMs: 5_000,
+    localSwitchTimeoutMs: 300,
+    cacheTtlMs: 500,
   },
 });
 
-console.log("Constructed a browser-friendly hub that will connect remote first and then probe the local leaf in the background when used in a browser session.");
-
-await hub.dispose();
+try {
+  await hub.connected(10_000);
+  console.log("remote connection is ready:", hub.nats?.getServer?.());
+  console.log("configured demo server:", DEMO_SERVER);
+  console.log("a failed local discovery probe does not replace the remote connection");
+  await delay(400);
+} finally {
+  await hub.dispose();
+}

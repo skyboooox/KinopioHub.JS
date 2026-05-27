@@ -1,172 +1,170 @@
 # KinopioHub.JS
 
-Cloud-native communication framework designed to use remote variables and functions locally
+KinopioHub.JS is a browser-friendly and Node-capable JavaScript client for using NATS subjects as local variables and request handlers.
 
 [![npm version](https://badge.fury.io/js/kinopio-hub.svg?icon=si%3Anpm)](https://www.npmjs.com/package/kinopio-hub)
 ![License: GPL-3.0-or-later](https://img.shields.io/badge/license-GPL--3.0--or--later-green)
 
 [中文](./README_CN.md)
 
-## Features
-
-- 🔍 Automatic value tracking and caching
-- 🌳 Hierarchical scope system
-- 🔄 Automatic reconnection handling
-- 🛡️ Built-in error handling and retry mechanisms
-- 🧭 Node-only local leaf runtime, LAN auto-election, browser background discovery, and packaged CLI support
-
-## Installation
+## Install
 
 ```bash
 npm install kinopio-hub
 ```
 
-On `npm install`, the package now performs a best-effort prefetch of the official `nats-server v2.12.7` binary into the user cache so the Node-only leaf runtime can start quickly later. Set `KINOPIO_SKIP_NATS_SERVER_DOWNLOAD=1` if you need to skip that prefetch during installation.
+During install the package best-effort downloads `nats-server v2.12.7` into the user cache for the Node-only leaf runtime. Set `KINOPIO_SKIP_NATS_SERVER_DOWNLOAD=1` to skip that install-time prefetch.
 
 ## Quick Start
 
 ```javascript
-import KinopioHub, { KINOPIO_STATE_EVENT } from 'kinopio-hub';
+import KinopioHub from "kinopio-hub";
 
-// Create new instance
 const hub = new KinopioHub({
-  servers: ["wss://nats.example.com:443"],
-  debug: true
+  servers: ["wss://demo.nats.io:8443"],
+  serverSelectionMode: "ordered",
+  autoLeaf: false,
+  discovery: false,
 });
 
-// Use scoped variables
-const myScope = hub.getScope("myScope");
-const myVar = myScope.getVariable("myVar");
+await hub.connected();
 
-// Publish data
-await myVar.pub({ message: "Hello!" });
+const status = hub.getScope("demo").getVariable("status");
 
-// Subscribe to updates
-await myVar.sub(data => {
-  console.log("Received:", data);
+const subscription = await status.sub((value) => {
+  console.log("status changed:", value);
 });
+
+await status.pub({ online: true, at: Date.now() });
+
+subscription.unsubscribe();
+await hub.dispose();
 ```
 
-## Core Concepts
+Important demo note: `KinopioHub` can do local discovery and, in non-browser Node runtimes, auto-start a local leaf. The examples in this repository deliberately set `autoLeaf: false` and `discovery: false` when demonstrating the public demo server so all traffic goes to `wss://demo.nats.io:8443`.
+
+## Feature Map
+
+| Feature | API | Example |
+| --- | --- | --- |
+| Connection lifecycle | `connect()`, `connected()`, `reconnect()`, `dispose()`, `onStateChange()` | [example/connection.mjs](./example/connection.mjs) |
+| Scopes and variables | `getScope()`, `getVariable()`, dynamic `hub.scope.variable` access | [example/scope.mjs](./example/scope.mjs) |
+| Publish | `variable.pub()` | [example/publish.mjs](./example/publish.mjs) |
+| Subscribe | `variable.sub()`, returned subscription handles | [example/subscribe.mjs](./example/subscribe.mjs) |
+| Request/reply | `variable.serve()`, `variable.req()`, `hub.request()` | [example/request-reply.mjs](./example/request-reply.mjs) |
+| Serialization | `codec`, `serializeData()`, `deserializeData()` | [example/codec.mjs](./example/codec.mjs) |
+| Browser local discovery | `discovery` option and manifest probing | [example/browser-discovery.mjs](./example/browser-discovery.mjs) |
+| Manual local leaf | `startLeafNode()` from `kinopio-hub/leaf` | [example/leaf-entrypoint.mjs](./example/leaf-entrypoint.mjs) |
+| LAN auto leaf | `enableAutoLeaf()` from `kinopio-hub/leaf` | [example/auto-leaf.mjs](./example/auto-leaf.mjs) |
+
+## Core API
 
 ### KinopioHub
 
-The main client class for managing connections and providing access to scopes and variables.
-
 ```javascript
 const hub = new KinopioHub({
-  servers: ["wss://demo.nats.io:8443", "wss://demo.nats.io:4443"],
-  serverSelectionMode: "latency",
-  debug: true,
-  noEcho: false,
-  reconnectTimeout: 5000
+  servers: ["wss://demo.nats.io:8443"],
+  serverSelectionMode: "ordered",
+  autoConnect: false,
+  autoRetry: false,
 });
+
+const stop = hub.onStateChange((state) => console.log(state));
+
+await hub.connect();
+await hub.connected(10_000);
+await hub.reconnect();
+
+stop();
+await hub.dispose();
 ```
+
+`servers` must be `ws://` or `wss://` URLs for the root client. Use `autoRetry: false` in tests or examples that should fail fast when the server is unavailable.
 
 ### Scopes
 
-Scopes help organize variables into logical groups:
+Scopes are the first subject segment you manage explicitly. Variables append one more segment.
 
 ```javascript
-// Get scope
-const userScope = hub.getScope("users");
+const devices = hub.getScope("devices");
+const battery = devices.getVariable("battery");
 
-// Access variables within scope
-const onlineUsers = userScope.getVariable("online");
-const userCount = userScope.getVariable("count");
+console.log(battery.subject); // devices.battery
 
-// Dynamic property access
-const onlineUsers = hub.users.online;  // Equivalent to above
+const sameVariable = hub.devices.battery;
 ```
+
+Dynamic property access is convenient, but `getScope()` and `getVariable()` are clearer when names are computed at runtime.
 
 ### Variables
 
-Variables are data containers within scopes that support publish, subscribe, and request-response patterns:
-
 ```javascript
-// Publish
-await myVar.pub({ count: 42 });
+const temperature = hub.getScope("room").getVariable("temperature");
 
-// Subscribe
-await myVar.sub(data => {
-  console.log("Value updated:", data);
+await temperature.pub({ celsius: 22.5 });
+
+const sub = await temperature.sub((value, message) => {
+  console.log(value, message.subject);
 });
 
-// Request-response pattern
-const response = await myVar.req({ action: "getData" });
+console.log(temperature.value);
 
-// Service handler
-await myVar.serve(async (request) => {
-  if (request.action === "getData") {
-    return { value: "some data" };
-  }
-});
+sub.unsubscribe();
 ```
 
-## Configuration Options
+Each variable tracks its latest local value. Publishing identical bytes twice in a row from the same variable is deduplicated.
 
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| servers | string[] | ["wss://demo.nats.io:8443", "wss://demo.nats.io:4443"] | List of NATS server URLs |
-| debug | boolean | false | Enable debug logging |
-| noEcho | boolean | false | Don't receive own published messages |
-| serverSelectionMode | "ordered" \| "random" \| "latency" | "latency" | How KinopioHub orders multiple candidate servers before connecting |
-| maxReconnectAttempts | number | -1 | Maximum reconnection attempts (-1 for infinite) |
-| waitOnFirstConnect | boolean | true | Wait for first connection |
-| reconnectTimeout | number | 5000 | Reconnection timeout (milliseconds) |
-| reconnectTimeWait | number | 500 | Reconnection interval (milliseconds) |
-| pingInterval | number | 3000 | Ping interval (milliseconds) |
-| maxPingOut | number | 3 | Maximum unresponded pings before reconnect |
-| timeout | number | 3000 | Operation timeout (milliseconds) |
-| healthReport | number | 5000 | Health report interval (milliseconds) |
-| autoConnect | boolean | true | Start connecting as soon as the hub is constructed |
-| autoRetry | boolean | true | Auto retry on connection failure |
-| retryDelay | number | 1000 | Initial retry delay (ms) |
-| retryBackoffFactor | number | 1.5 | Backoff multiplier |
-| maxRetryDelay | number | 30000 | Max retry delay (ms) |
-| discovery | `{ enabled?, manifestUrl?, backgroundLocalProbe?, localSwitchTimeoutMs?, cacheTtlMs? }` | undefined | Browser-side local leaf discovery controls for the background LAN probe and hot-switch flow |
-| codec | {encode(data):Uint8Array, decode(bytes):any} | undefined | Custom codec for serialization |
-| jsonReplacer | Function | undefined | JSON.stringify replacer |
-| jsonReviver | Function | undefined | JSON.parse reviver |
-
-Legacy `noRandomize` is still accepted as a compatibility alias when `serverSelectionMode` is not set, but it is no longer the primary public option.
-
-Browser discovery now runs in the root browser-friendly runtime when `discovery.enabled === true`. The default flow is still "connect to the configured remote servers first, then probe for a local leaf in the background". Probe failures stay silent and do not block the initial remote session.
-
-### Server Selection Modes
-
-- `ordered`: keep the input server order for the initial connect and the underlying NATS reconnect sequence.
-- `random`: reshuffle the candidate server order before each fresh connect or manual reconnect, then keep that shuffled order stable for that connection lifecycle.
-- `latency`: the default mode. Before each fresh connect or manual reconnect, KinopioHub probes every configured server in parallel, measures RTT using the NATS client's `flush()` / `rtt()` semantics, then prefers healthy servers with lower RTT. Probe failures are kept at the end in original input order, and if every probe fails the library falls back to the original input order. After a successful latency-mode connection, KinopioHub re-probes every 10 minutes and hot-switches only when another healthy server is at least 30ms faster. The switch flow rebuilds value tracking, logical subscriptions, and services on the new connection before draining the old one. During that brief dual-subscription window, regular subscribers may observe a very small number of duplicate callbacks.
-
-### Typical Mode Examples
+### Request/Reply
 
 ```javascript
-// Keep a fixed primary/fallback order
-const orderedHub = new KinopioHub({
-  servers: ["wss://primary.example.com:443", "wss://backup.example.com:443"],
-  serverSelectionMode: "ordered"
+const calculator = hub.getScope("math").getVariable("calculator");
+
+const service = await calculator.serve(async (request) => {
+  return { result: request.a + request.b };
 });
 
-// Reshuffle candidates on each fresh connect cycle
-const randomHub = new KinopioHub({
-  servers: ["wss://a.example.com:443", "wss://b.example.com:443"],
-  serverSelectionMode: "random"
-});
+const response = await calculator.req({ a: 2, b: 3 });
+console.log(response.result);
 
-// Prefer the lowest-latency server and auto-migrate in the background
-const latencyHub = new KinopioHub({
-  servers: ["wss://edge-a.example.com:443", "wss://edge-b.example.com:443"],
-  serverSelectionMode: "latency"
-});
+service.unsubscribe();
 ```
 
-### Browser Local Discovery
+`hub.request(subject, data)` is also available when you already have a subject string.
+
+## Options
+
+| Option | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `servers` | `string[]` | `["wss://demo.nats.io:8443", "wss://demo.nats.io:4443"]` | Root client WebSocket endpoints. |
+| `debug` | `boolean` | `false` | Prints connection, retry, discovery, and hot-switch logs. |
+| `noEcho` | `boolean` | `false` | Set `true` to avoid receiving messages published by the same connection. |
+| `serverSelectionMode` | `"ordered" \| "random" \| "latency"` | `"latency"` | Controls candidate ordering before a fresh connection. |
+| `autoConnect` | `boolean` | `true` | Set `false` for manual `connect()`. |
+| `autoRetry` | `boolean` | `true` | Set `false` for fail-fast tests. |
+| `timeout` | `number` | `3000` | Operation timeout in milliseconds. |
+| `retryDelay` | `number` | `1000` | First reconnect delay before jitter/backoff. |
+| `retryBackoffFactor` | `number` | `1.5` | Retry delay multiplier. |
+| `maxRetryDelay` | `number` | `30000` | Upper bound for retry delay. |
+| `discovery` | `false \| object` | `{ enabled: true }` | Manifest-based local leaf probing and hot-switching. |
+| `autoLeaf` | `boolean \| object` | Node: enabled, browser: disabled | Non-browser Node auto leaf startup. |
+| `codec` | `{ encode, decode }` | `undefined` | Custom binary serialization. |
+| `jsonReplacer` / `jsonReviver` | functions | `undefined` | JSON fallback customization. |
+
+Legacy `noRandomize` is still accepted when `serverSelectionMode` is not set. Prefer `serverSelectionMode` in new code.
+
+## Server Selection
+
+- `ordered`: keep the input server order.
+- `random`: shuffle candidates for each fresh connection lifecycle.
+- `latency`: probe candidates, prefer lower RTT, then periodically re-probe. If a later candidate is at least 30ms faster, KinopioHub can rebuild value tracking, subscriptions, and services on the faster connection before draining the old one.
+
+Use `ordered` for deterministic examples and `latency` for real multi-edge deployments.
+
+## Local Discovery
 
 ```javascript
 const hub = new KinopioHub({
-  servers: ["wss://remote.example.com:443"],
-  serverSelectionMode: "ordered",
+  servers: ["wss://demo.nats.io:8443"],
   discovery: {
     enabled: true,
     manifestUrl: "https://app.example.com/.well-known/kinopio-leader.json",
@@ -177,159 +175,91 @@ const hub = new KinopioHub({
 });
 ```
 
-- `manifestUrl` defaults to the current page origin plus `/.well-known/kinopio-leader.json` when you omit it.
-- The browser stays on the configured remote servers for the initial connect, then fetches the discovery manifest in the background.
-- If the manifest exposes a healthy local `wssUrl` and the browser can really establish that local connection, KinopioHub hot-switches the current session to the local leaf and rebuilds value tracking, subscriptions, and services on the new connection before draining the old one.
-- If the local leaf disappears later, KinopioHub falls back to the configured remote servers and keeps probing in the background for the next usable local leader.
-- If the manifest fetch fails or the browser cannot trust/connect to the discovered local `wss`, the current remote session stays in place.
-- Browsers on other devices are still constrained by ordinary TLS trust rules. Installing trust on the leader machine helps that machine's browser first; it does not magically make every remote browser trust the same local CA.
+Discovery connects to the configured remote servers first, then probes a manifest for a healthier local leaf. If the manifest is absent, expired, unreachable, or exposes a local WebSocket URL the client cannot connect to, the remote connection stays active.
 
-### Operational Boundaries
+In a browser, omitted `manifestUrl` defaults to the current origin plus `/.well-known/kinopio-leader.json`. In Node, pass a manifest URL explicitly or use `autoLeaf`.
 
-- A browser session is not itself a leaf node and does not launch `nats-server` directly.
-- A Node-capable device participates in discovery and election through `enableAutoLeaf()` or `kinopio-hub leaf auto`.
-- If a healthy leader already exists in the same `discoveryNamespace`, a new capable device stays in `following-leader` and does not start a duplicate local leaf.
-- In open multi-device browser environments, local-first routing remains an enhancement path because TLS trust still has to exist on each browser device.
+## Node Leaf Runtime
 
-## Advanced Usage
-
-### Packaged CLI
-
-After installation, the package exposes a `kinopio-hub` CLI:
-
-```bash
-kinopio-hub --help
-kinopio-hub leaf start --discovery-namespace studio
-kinopio-hub leaf auto --discovery-namespace studio --backbone-server nats://upstream.example.com:7422
-```
-
-- `kinopio-hub leaf start` is the manual runtime wrapper around `startLeafNode()`.
-- `kinopio-hub leaf auto` is the auto-election wrapper around `enableAutoLeaf()`.
-- Both commands keep running until `Ctrl+C`, print an initial status snapshot, and accept `--json` if you want machine-readable output only.
-- The CLI uses the same generated-CA / trust-install behavior as the Node-only leaf API, including `KINOPIO_SKIP_CA_TRUST_INSTALL=1` for CI or restricted environments.
-
-### Node-only Leaf Entrypoint
-
-The package now exposes a Node-only subpath for the local leaf runtime:
+The root `kinopio-hub` entrypoint stays browser-friendly. Node-only local leaf APIs live under `kinopio-hub/leaf`.
 
 ```javascript
-import { enableAutoLeaf, startLeafNode } from "kinopio-hub/leaf";
+import { startLeafNode, enableAutoLeaf } from "kinopio-hub/leaf";
 ```
 
-`enableAutoLeaf()` is now the phase-3 high-level entrypoint. It joins a LAN-scoped coordination namespace, reuses a stable cached `nodeId`, listens for an existing healthy leaf over UDP multicast plus mDNS, and only starts a local leaf when the namespace needs a leader.
+Manual leaf startup:
 
 ```javascript
-import { enableAutoLeaf } from "kinopio-hub/leaf";
-
-const autoLeaf = await enableAutoLeaf({
-  discoveryNamespace: "studio",
-  backboneServers: ["nats://upstream.example.com:7422"],
-  leaderMissingGraceMs: 10_000,
-});
-
-console.log(autoLeaf.status());
-
-// Later:
-await autoLeaf.stop();
-```
-
-`startLeafNode()` remains the low-level manual runtime entrypoint. It resolves a cached `nats-server` binary, writes a temporary config, starts a local leaf server, exposes WSS plus an HTTPS discovery manifest, and returns a handle with `wssUrl`, `discoveryUrl`, `clientUrl`, `monitorUrl`, `status()`, and `stop()`.
-
-```javascript
-import { startLeafNode } from "kinopio-hub/leaf";
-
 const leaf = await startLeafNode({
   discoveryNamespace: "studio",
-  backboneServers: ["nats://upstream.example.com:7422"],
+  backboneServers: ["wss://demo.nats.io:8443"],
+  webSocketTls: false,
 });
 
-console.log(leaf.status());
+console.log(leaf.status().websocketUrl);
 await leaf.stop();
+```
+
+LAN auto election:
+
+```javascript
+const agent = await enableAutoLeaf({
+  discoveryNamespace: "studio",
+  backboneServers: ["wss://demo.nats.io:8443"],
+  webSocketTls: false,
+});
+
+console.log(agent.status());
+await agent.stop();
 ```
 
 Leaf runtime notes:
 
-- `backboneServers` are normalized into NATS leaf remote URLs and are optional. If they are unreachable, `startLeafNode()` can still succeed locally while `status().bridgeState` stays `"connecting"`.
-- `enableAutoLeaf()` keeps one leader per `discoveryNamespace`. If a healthy leader is already present, new capable devices stay in `following-leader` and do not start a duplicate local leaf.
-- If the leader disappears, followers wait through `leaderMissingGraceMs` before electing a replacement. The default grace window is 10 seconds.
-- When RTT measurements are available, election priority is lower RTT first, measurable RTT over unmeasurable RTT, then stable `nodeId`. Healthy leaders are only preempted after a sustained advantage of at least 50ms.
-- The local client listener binds to loopback, while WSS and discovery bind to the detected LAN address by default.
-- If you do not provide `tls.certFile` and `tls.keyFile`, the leaf runtime now auto-generates a reusable local root CA, issues a short-lived leaf certificate for the current `advertisedHostname`, and then best-effort attempts to install that CA into the current leader device's trust store.
-- `status().tls` reports whether the runtime is using caller-provided PEM files or the generated local CA, and whether CA trust installation was `installed`, `skipped`, `failed`, or left `external`.
-- Automatic trust installation is intentionally best-effort. On open multi-device browser deployments, a remote browser may still reject the local `wss` until that device also trusts the CA.
-- Set `KINOPIO_SKIP_CA_TRUST_INSTALL=1` if you need to skip trust-store mutation during CI, automation, or other restricted environments.
-- The root `kinopio-hub` entrypoint remains browser-friendly and does not pull in Node-only process control logic.
-- Example files in this repository:
-  [example/leaf-entrypoint.mjs](./example/leaf-entrypoint.mjs),
-  [example/auto-leaf.mjs](./example/auto-leaf.mjs),
-  [example/browser-discovery.mjs](./example/browser-discovery.mjs)
+- `backboneServers` are upstream leaf remotes for the bundled `nats-server`, not root-client `wsconnect()` targets.
+- With the public `wss://demo.nats.io:8443` endpoint, the examples verify local leaf startup and cleanup. The bridge can remain `"connecting"` if the public demo server does not accept leaf remote connections.
+- Use one remote transport mode per leaf runtime: all `ws://`, all `wss://`, or all native leafnode URLs.
+- `webSocketTls` defaults to `true`. Set it to `false` for local development when you want `ws://` plus `http://` discovery.
+- When TLS is enabled without explicit PEM files, the runtime can generate a local CA and best-effort install trust on the current machine. Set `KINOPIO_SKIP_CA_TRUST_INSTALL=1` in CI or restricted environments.
 
-### Connection Management
+## CLI
 
-```javascript
-// Wait for connection
-await hub.connected();
-
-// Manual reconnection
-await hub.reconnect();
-
-// Clean up resources
-await hub.dispose();
+```bash
+kinopio-hub --help
+kinopio-hub leaf start --discovery-namespace studio --backbone-server wss://demo.nats.io:8443 --no-websocket-tls
+kinopio-hub leaf auto --discovery-namespace studio --backbone-server wss://demo.nats.io:8443 --no-websocket-tls
 ```
 
-### Error Handling
+The CLI wraps the same `startLeafNode()` and `enableAutoLeaf()` APIs and keeps running until interrupted.
 
-```javascript
-try {
-  await myVar.pub(data);
-} catch (error) {
-  console.error("Publish failed:", error);
-}
+## Run Examples
 
-// Enable debug logging
-const hub = new KinopioHub({ debug: true });
+Each runnable example is self-contained and uses `wss://demo.nats.io:8443`.
 
-// Listen to state changes
-const stop = hub.onStateChange((state) => console.log('state:', state));
-// or using event constant
-// event.on(KINOPIO_STATE_EVENT, listener)
-stop();
+```bash
+node example/connection.mjs
+node example/scope.mjs
+node example/publish.mjs
+node example/subscribe.mjs
+node example/request-reply.mjs
+node example/codec.mjs
+node example/browser-discovery.mjs
+node example/leaf-entrypoint.mjs
+node example/auto-leaf.mjs
 ```
 
-For tests, SSR setup, or manual connection control, disable automatic connection:
+To run them as a smoke suite:
 
-```javascript
-const hub = new KinopioHub({ autoConnect: false });
-await hub.connect();
+```bash
+for file in example/*.mjs; do
+  case "$file" in */_shared.mjs) continue ;; esac
+  echo "==> $file"
+  KINOPIO_SKIP_CA_TRUST_INSTALL=1 node "$file"
+done
 ```
-
-### Service Mode
-
-```javascript
-// Server side
-await myVar.serve(async (request) => {
-  if (request.action === "increment") {
-    return { value: currentValue + 1 };
-  }
-  throw new Error("Unknown action");
-});
-
-// Client side
-const response = await myVar.req({ action: "increment" });
-console.log(response.value);
-```
-
-## Examples
-
-See the [examples directory](./example) for more detailed examples.
-
-> Note on default servers: the default `servers` values use NATS demo endpoints and are intended for development/testing only. For production, configure your own secure NATS servers.
 
 ## Development
 
-See [How_To_Dev.md](./How_To_Dev.md) for development guidelines.
-
-Quick verification commands:
+See [How_To_Dev.md](./How_To_Dev.md).
 
 ```bash
 npm test
@@ -338,4 +268,4 @@ npm run test:bun
 
 ## License
 
-GPL-3.0-or-later - see [LICENSE](./LICENSE) file for details.
+GPL-3.0-or-later. See [LICENSE](./LICENSE).

@@ -15,6 +15,7 @@ export interface LeafDiscoveryManifest {
   websocketUrl: string;
   wssUrl: string;
   fallbackServers: string[];
+  bridgeState?: "connecting" | "connected" | "disconnected" | "error";
   backboneRttMs: number | null;
   discoveryUrl?: string;
   leaseExpiresAt?: string;
@@ -89,6 +90,7 @@ export interface LeafNodeHandle {
     binaryPath: string;
     runtimeDir: string;
     lanBindAddress: string;
+    backboneServers: string[];
     ports: {
       client: number;
       websocket: number;

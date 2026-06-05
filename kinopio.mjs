@@ -11,8 +11,10 @@ const LATENCY_SWITCH_THRESHOLD_MS = 30;
 const DEFAULT_DISCOVERY_MANIFEST_PATH = "/.well-known/kinopio-leader.json";
 const DEFAULT_DISCOVERY_CACHE_TTL_MS = 5_000;
 const DEFAULT_LOCAL_SWITCH_TIMEOUT_MS = 1_500;
+const DEFAULT_AUTO_LEAF_BACKBONE_PORT = 17_222;
 const CLIENT_CONNECT_PROTOCOLS = new Set(["ws:", "wss:"]);
 const DISCOVERY_MANIFEST_PROTOCOLS = new Set(["http:", "https:"]);
+const DISCOVERY_BRIDGE_STATES = new Set(["connecting", "connected", "disconnected", "error"]);
 
 function isPlainObject(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -71,6 +73,27 @@ function serversMatch(left, right) {
   const leftIdentity = normalizeServerIdentity(left);
   const rightIdentity = normalizeServerIdentity(right);
   return Boolean(leftIdentity && rightIdentity && leftIdentity === rightIdentity);
+}
+
+function deriveDefaultBackboneServer(clientServer) {
+  if (typeof clientServer !== "string" || clientServer.trim() === "") {
+    return null;
+  }
+
+  try {
+    const parsed = new URL(clientServer.trim());
+    if (!CLIENT_CONNECT_PROTOCOLS.has(parsed.protocol) || !parsed.hostname) {
+      return null;
+    }
+
+    const protocol = parsed.protocol === "wss:" ? "tls:" : "nats:";
+    const hostname = parsed.hostname.includes(":") && !parsed.hostname.startsWith("[")
+      ? `[${parsed.hostname}]`
+      : parsed.hostname;
+    return `${protocol}//${hostname}:${DEFAULT_AUTO_LEAF_BACKBONE_PORT}`;
+  } catch {
+    return null;
+  }
 }
 
 function normalizeClientConnectServer(value, label = "server") {
@@ -158,6 +181,7 @@ function normalizeDiscoveryManifest(manifest) {
         .map(server => server.trim())
         .filter(Boolean)
       : [],
+    bridgeState: DISCOVERY_BRIDGE_STATES.has(manifest.bridgeState) ? manifest.bridgeState : undefined,
     backboneRttMs: isPositiveFiniteNumber(manifest.backboneRttMs) || manifest.backboneRttMs === 0
       ? manifest.backboneRttMs
       : null,
@@ -238,6 +262,7 @@ export class KinopioHub {
   #autoLeafMonitorTimer = null;
   #autoLeafDiscoveryManifestUrl = null;
   #autoLeafDiscoveryNamespace = null;
+  #autoLeafBackboneServersKey = null;
   
   /**
    * Creates a new KinopioHub instance
@@ -261,10 +286,12 @@ export class KinopioHub {
    * @param {boolean} [options.discovery.enabled=true] - Enable local leaf discovery and hot-switching
    * @param {string} [options.discovery.manifestUrl] - Override the discovery manifest URL used by the local probe flow
    * @param {boolean} [options.discovery.backgroundLocalProbe=true] - Keep probing in the background after the initial remote connection is ready
+   * @param {boolean} [options.discovery.requireBackbone] - Require discovered local leaves to have a connected upstream bridge before hot-switching; defaults to true for auto-leaf discovery
    * @param {number} [options.discovery.localSwitchTimeoutMs=1500] - Timeout for switching the current session to a discovered local leaf
    * @param {number} [options.discovery.cacheTtlMs=5000] - Cache TTL for discovery manifest reuse and re-probe cadence
    * @param {boolean|Object} [options.autoLeaf] - Auto-start a local leaf in non-browser Node runtimes; set `false` to disable startup
    * @param {boolean} [options.autoLeaf.enabled=true] - Enable non-browser auto leaf startup
+   * @param {string[]} [options.autoLeaf.backboneServers] - Explicit upstream leaf remotes. When omitted, auto leaf maps the connected ws/wss server host to port 17222 and keeps the remaining configured hosts as fallbacks
    * @param {string} [options.autoLeaf.discoveryNamespace="local"] - Discovery namespace used by the auto-started local leaf
    * @param {boolean} [options.autoLeaf.webSocketTls=false] - Expose the auto-started local leaf over WSS (true) or WS (false)
    * @param {Object} [options.codec] - Custom codec with encode(data) and decode(bytes)
@@ -319,8 +346,6 @@ export class KinopioHub {
     this.isConnected = false;
     this.debug = this.#options.debug;
 
-    void this.#initAutoLeaf();
-    
     // Start connection
     if (this.#options.autoConnect !== false) {
       this.#initConnection();
@@ -465,6 +490,9 @@ export class KinopioHub {
     return {
       manifestUrl,
       backgroundLocalProbe: discoveryOptions.backgroundLocalProbe !== false,
+      requireBackbone: discoveryOptions.requireBackbone === undefined
+        ? manifestUrl === this.#autoLeafDiscoveryManifestUrl
+        : discoveryOptions.requireBackbone !== false,
       localSwitchTimeoutMs: isPositiveFiniteNumber(discoveryOptions.localSwitchTimeoutMs)
         ? Math.floor(discoveryOptions.localSwitchTimeoutMs)
         : DEFAULT_LOCAL_SWITCH_TIMEOUT_MS,
@@ -485,9 +513,15 @@ export class KinopioHub {
     }
 
     if (autoLeaf === true || autoLeaf === undefined) {
+      const backboneServers = this.#getDefaultAutoLeafBackboneServers();
+      if (backboneServers.length === 0) {
+        return null;
+      }
+
       return {
         enabled: true,
         discoveryNamespace: "local",
+        backboneServers,
         webSocketTls: false,
       };
     }
@@ -500,9 +534,18 @@ export class KinopioHub {
       return null;
     }
 
+    const hasExplicitBackboneServers = Object.prototype.hasOwnProperty.call(autoLeaf, "backboneServers");
+    const backboneServers = hasExplicitBackboneServers ? [] : this.#getDefaultAutoLeafBackboneServers();
+    if (!hasExplicitBackboneServers && backboneServers.length === 0) {
+      return null;
+    }
+
     return {
       ...autoLeaf,
       enabled: true,
+      backboneServers: hasExplicitBackboneServers
+        ? autoLeaf.backboneServers
+        : backboneServers,
       discoveryNamespace:
         typeof autoLeaf.discoveryNamespace === "string" && autoLeaf.discoveryNamespace.trim() !== ""
           ? autoLeaf.discoveryNamespace.trim()
@@ -521,6 +564,39 @@ export class KinopioHub {
     return typeof manifestUrl === "string" && manifestUrl.trim() !== ""
       ? normalizeDiscoveryEndpointUrl(manifestUrl, "auto leaf discovery manifest URL")
       : null;
+  }
+
+  #getDefaultAutoLeafBackboneServers() {
+    const currentPlan = this.#activeConnectionPlan;
+    if (!currentPlan || currentPlan.discoveryLocalServer) {
+      return [];
+    }
+
+    const connectedServer =
+      this.#activeConnection?.getServer?.() ||
+      currentPlan.connectedServer ||
+      null;
+    if (!connectedServer) {
+      return [];
+    }
+
+    const candidates = [
+      ...(currentPlan.sourceCandidates || []),
+      ...(currentPlan.orderedCandidates || []),
+    ];
+    const connectedCandidate = candidates.find(candidate => serversMatch(candidate, connectedServer));
+    const orderedCandidates = connectedCandidate
+      ? [
+          connectedCandidate,
+          ...candidates.filter(candidate => !serversMatch(candidate, connectedCandidate)),
+        ]
+      : candidates;
+
+    return uniqueServers(
+      orderedCandidates
+        .map(deriveDefaultBackboneServer)
+        .filter(Boolean),
+    );
   }
 
   async #refreshAutoLeafDiscoveryState() {
@@ -611,6 +687,26 @@ export class KinopioHub {
     }
   }
 
+  async #syncAutoLeafForActiveRemote() {
+    const autoLeafOptions = this.#resolveAutoLeafOptions();
+    if (!autoLeafOptions) {
+      await this.#disposeAutoLeaf();
+      return null;
+    }
+
+    const nextBackboneServersKey = JSON.stringify(autoLeafOptions.backboneServers || []);
+    if (this.#autoLeafHandle && this.#autoLeafBackboneServersKey === nextBackboneServersKey) {
+      return this.#autoLeafHandle;
+    }
+
+    if (this.#autoLeafHandle || this.#autoLeafStartupPromise) {
+      await this.#disposeAutoLeaf();
+    }
+
+    this.#autoLeafBackboneServersKey = nextBackboneServersKey;
+    return await this.#initAutoLeaf();
+  }
+
   async #disposeAutoLeaf() {
     this.#clearAutoLeafMonitorTimer();
 
@@ -618,6 +714,7 @@ export class KinopioHub {
     this.#autoLeafHandle = null;
     this.#autoLeafDiscoveryManifestUrl = null;
     this.#autoLeafDiscoveryNamespace = null;
+    this.#autoLeafBackboneServersKey = null;
 
     const startupPromise = this.#autoLeafStartupPromise;
     this.#autoLeafStartupPromise = null;
@@ -897,6 +994,22 @@ export class KinopioHub {
     return connectionPlan?.mode === "latency" && connectionPlan?.sourceCandidates?.length > 1;
   }
 
+  async #handleActiveConnectionReconnect(connection) {
+    const currentPlan = this.#activeConnectionPlan;
+    if (!currentPlan || currentPlan.discoveryLocalServer || connection !== this.#activeConnection) {
+      return;
+    }
+
+    const connectedServer = connection.getServer?.();
+    if (!connectedServer || serversMatch(currentPlan.connectedServer, connectedServer)) {
+      return;
+    }
+
+    currentPlan.connectedServer = connectedServer;
+    await this.#syncAutoLeafForActiveRemote();
+    await this.#startDiscoveryFlowForActiveConnection({ immediateProbe: true });
+  }
+
   #isUsingDiscoveryLocalConnection(connectionPlan = this.#activeConnectionPlan) {
     if (!connectionPlan?.discoveryLocalServer || !this.#activeConnection) {
       return false;
@@ -1125,6 +1238,13 @@ export class KinopioHub {
       return await this.#switchToRemoteDiscoveryFallback(discoveryOptions, "manifest did not expose a usable websocketUrl");
     }
 
+    if (discoveryOptions.requireBackbone && manifest.bridgeState !== "connected") {
+      return await this.#switchToRemoteDiscoveryFallback(
+        discoveryOptions,
+        `local leaf bridge is ${manifest.bridgeState || "unknown"}`,
+      );
+    }
+
     if (serversMatch(currentPlan?.discoveryLocalServer, localServer) && serversMatch(currentServer, localServer)) {
       currentPlan.discoveryManifest = manifest;
       currentPlan.discoveryManifestUrl = discoveryOptions.manifestUrl;
@@ -1278,6 +1398,9 @@ export class KinopioHub {
       await this.#promoteCandidateConnection(candidateConnection, connectionPlan);
       this.#startHealthCheck(candidateConnection);
       this.#scheduleLatencyProbeCycle();
+      if (!connectionPlan.discoveryLocalServer) {
+        await this.#syncAutoLeafForActiveRemote();
+      }
       await this.#startDiscoveryFlowForActiveConnection({ immediateProbe: false });
 
       if (previousConnection && previousConnection !== candidateConnection) {
@@ -1409,6 +1532,7 @@ export class KinopioHub {
         this.#startHealthCheck(candidateConnection);
         this.#scheduleLatencyProbeCycle();
         await this.#setState("connected");
+        await this.#syncAutoLeafForActiveRemote();
         await this.#startDiscoveryFlowForActiveConnection({ immediateProbe: true });
         
         // Reset retry state on successful connection
@@ -1615,6 +1739,9 @@ export class KinopioHub {
         const newState = stateMap[status.type];
         if (newState) {
           await this.#setState(newState);
+        }
+        if (status.type === "reconnect") {
+          await this.#handleActiveConnectionReconnect(connection);
         }
       }
     } catch (error) {

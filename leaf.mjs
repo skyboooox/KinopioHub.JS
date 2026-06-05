@@ -544,7 +544,7 @@ function renderLeafConfig({ paths, ports, lanBindAddress, advertisedHostname, no
       ...(needsRemoteTls ? ["      tls {}"] : []),
       "    }",
       "  ]",
-      "  reconnect: 2",
+      "  reconnect: 2s",
       "}",
     );
   }
@@ -1793,6 +1793,7 @@ function createDiscoveryManifest(state) {
     wssUrl: state.wssUrl,
     discoveryUrl: state.discoveryUrl,
     fallbackServers: [...state.backboneServers],
+    bridgeState: state.bridgeState,
     backboneRttMs: manifestBackboneRttMs,
     leaseExpiresAt,
     nodeId: state.manifestState.nodeId || undefined,
@@ -1815,6 +1816,7 @@ function snapshotState(state) {
     binaryPath: state.binaryPath,
     runtimeDir: state.runtimeDir,
     lanBindAddress: state.lanBindAddress,
+    backboneServers: [...state.backboneServers],
     ports: { ...state.ports },
     configFile: state.configFile,
     logFile: state.logFile,

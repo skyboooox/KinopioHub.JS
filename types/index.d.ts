@@ -10,6 +10,7 @@ export interface KinopioDiscoveryOptions {
   enabled?: boolean;
   manifestUrl?: string;
   backgroundLocalProbe?: boolean;
+  requireBackbone?: boolean;
   localSwitchTimeoutMs?: number;
   cacheTtlMs?: number;
 }

@@ -324,7 +324,7 @@ async function measureTcpConnectRtt({ host, port }, timeoutMs = 1_500) {
     socket.once("connect", () => {
       clearTimeout(timeout);
       cleanup();
-      socket.end();
+      socket.destroy();
       resolve(Math.max(0, Math.round(performance.now() - startedAt)));
     });
     socket.once("error", (error) => {

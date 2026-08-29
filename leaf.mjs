@@ -1,6 +1,5 @@
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import dgram from "node:dgram";
 import { access } from "node:fs/promises";
 import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import http from "node:http";
@@ -8,7 +7,6 @@ import https from "node:https";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
-import tls from "node:tls";
 
 import {
   NATS_SERVER_VERSION,
@@ -41,6 +39,17 @@ import {
   extractKinopioLeafManifests,
   parseMdnsPacket,
 } from "./leaf-mdns.mjs";
+import { acquireSharedMulticastBus } from "./lib/leaf/multicast.mjs";
+import {
+  fetchJson,
+  measureBackboneRtt,
+  probeDiscoveryEndpoint,
+  probeMonitorHealth,
+  probeNatsClient,
+  probeTcpListener,
+  probeTlsListener,
+} from "./lib/leaf/probes.mjs";
+import { pushOutputLine, terminateChildProcess } from "./lib/leaf/process.mjs";
 
 const DEFAULT_LEAF_READY_TIMEOUT_MS = 20_000;
 const DEFAULT_BRIDGE_POLL_INTERVAL_MS = 1_000;
@@ -57,8 +66,6 @@ const AUTO_PROTOCOL_VERSION = 1;
 const GENERATED_CA_VALIDITY_DAYS = 3650;
 const GENERATED_LEAF_CERT_VALIDITY_DAYS = 30;
 const TRUST_INSTALL_COMMAND_TIMEOUT_MS = 8_000;
-
-const sharedMulticastBuses = new Map();
 
 function isPlainObject(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -286,193 +293,8 @@ async function resolveStableNodeId(customCacheDir, explicitNodeId) {
   };
 }
 
-function resolveBackboneProbeTarget(url) {
-  const parsed = new URL(url);
-  let port = parsed.port ? Number(parsed.port) : 4_222;
-  if (!parsed.port && parsed.protocol === "ws:") {
-    port = 80;
-  } else if (!parsed.port && parsed.protocol === "wss:") {
-    port = 443;
-  } else if (!parsed.port && (parsed.protocol === "nats-leaf:" || parsed.protocol === "tls:")) {
-    port = 7_422;
-  }
-
-  return {
-    host: parsed.hostname,
-    port,
-  };
-}
-
 function isWebSocketTlsEnabled(options) {
   return options.webSocketTls !== false;
-}
-
-async function measureTcpConnectRtt({ host, port }, timeoutMs = 1_500) {
-  const startedAt = performance.now();
-
-  return await new Promise((resolve, reject) => {
-    const socket = net.createConnection({ host, port });
-    const cleanup = () => {
-      socket.removeAllListeners();
-    };
-    const timeout = setTimeout(() => {
-      cleanup();
-      socket.destroy();
-      reject(new Error(`Timed out connecting to ${host}:${port}`));
-    }, timeoutMs);
-
-    socket.once("connect", () => {
-      clearTimeout(timeout);
-      cleanup();
-      socket.destroy();
-      resolve(Math.max(0, Math.round(performance.now() - startedAt)));
-    });
-    socket.once("error", (error) => {
-      clearTimeout(timeout);
-      cleanup();
-      socket.destroy();
-      reject(error);
-    });
-  });
-}
-
-async function measureBackboneRtt(backboneServers) {
-  if (!Array.isArray(backboneServers) || backboneServers.length === 0) {
-    return null;
-  }
-
-  const samples = await Promise.allSettled(
-    backboneServers.map(async (url) => {
-      const target = resolveBackboneProbeTarget(url);
-      return await measureTcpConnectRtt(target);
-    }),
-  );
-
-  const successfulSamples = samples
-    .filter(result => result.status === "fulfilled" && Number.isFinite(result.value))
-    .map(result => result.value);
-
-  if (successfulSamples.length === 0) {
-    return null;
-  }
-
-  return Math.min(...successfulSamples);
-}
-
-function createDisabledBus(error = null) {
-  return {
-    available: false,
-    error: error ? toErrorMessage(error) : null,
-    subscribe() {
-      return () => {};
-    },
-    async send() {
-      return false;
-    },
-    async release() {},
-  };
-}
-
-function createMulticastBus(name, { groupAddress, port }) {
-  const socket = dgram.createSocket({
-    type: "udp4",
-    reuseAddr: true,
-  });
-
-  const bus = {
-    name,
-    groupAddress,
-    port,
-    socket,
-    subscribers: new Set(),
-    refCount: 0,
-    ready: null,
-  };
-
-  socket.on("message", (message, remoteInfo) => {
-    for (const subscriber of [...bus.subscribers]) {
-      try {
-        subscriber(message, remoteInfo);
-      } catch {}
-    }
-  });
-
-  bus.ready = new Promise((resolve, reject) => {
-    const handleReady = () => {
-      try {
-        socket.addMembership(groupAddress);
-        socket.setBroadcast(false);
-        socket.setMulticastLoopback(true);
-        socket.setMulticastTTL(255);
-        socket.unref?.();
-        resolve();
-      } catch (error) {
-        reject(error);
-      }
-    };
-
-    socket.once("error", reject);
-    socket.bind(port, handleReady);
-  }).catch(async (error) => {
-    await new Promise(resolve => socket.close(() => resolve()));
-    throw error;
-  });
-
-  return bus;
-}
-
-async function acquireSharedMulticastBus(name, options) {
-  let bus = sharedMulticastBuses.get(name);
-  if (!bus) {
-    bus = createMulticastBus(name, options);
-    sharedMulticastBuses.set(name, bus);
-  }
-
-  try {
-    await bus.ready;
-  } catch (error) {
-    sharedMulticastBuses.delete(name);
-    if (options.optional) {
-      return createDisabledBus(error);
-    }
-    throw error;
-  }
-
-  bus.refCount += 1;
-  let released = false;
-
-  return {
-    available: true,
-    subscribe(listener) {
-      bus.subscribers.add(listener);
-      return () => {
-        bus.subscribers.delete(listener);
-      };
-    },
-    async send(payload) {
-      await bus.ready;
-      return await new Promise((resolve, reject) => {
-        bus.socket.send(payload, bus.port, bus.groupAddress, (error) => {
-          if (error) {
-            reject(error);
-            return;
-          }
-          resolve(true);
-        });
-      });
-    },
-    async release() {
-      if (released) return;
-      released = true;
-      bus.refCount -= 1;
-      if (bus.refCount > 0) {
-        return;
-      }
-
-      sharedMulticastBuses.delete(name);
-      await new Promise(resolve => bus.socket.close(() => resolve()));
-    },
-  };
 }
 
 function quoteConfigValue(value) {
@@ -991,168 +813,6 @@ async function ensureRuntimeFolders(runtimePaths) {
   await mkdir(runtimePaths.storeDir, { recursive: true });
   await mkdir(runtimePaths.runDir, { recursive: true });
   await mkdir(runtimePaths.logsDir, { recursive: true });
-}
-
-async function probeMonitorHealth(monitorUrl) {
-  const healthUrl = new URL("/healthz", monitorUrl);
-  await new Promise((resolve, reject) => {
-    const request = http.get(healthUrl, (response) => {
-      const chunks = [];
-      response.setEncoding("utf8");
-      response.on("data", chunk => chunks.push(chunk));
-      response.on("end", () => {
-        if (response.statusCode === 200) {
-          resolve();
-          return;
-        }
-        reject(new Error(`Monitoring health probe returned ${response.statusCode}: ${chunks.join("")}`));
-      });
-    });
-    request.on("error", reject);
-  });
-}
-
-async function probeNatsClient(clientPort) {
-  await new Promise((resolve, reject) => {
-    const socket = net.createConnection({
-      host: "127.0.0.1",
-      port: clientPort,
-    });
-    let buffer = "";
-    let pingSent = false;
-    const timeout = setTimeout(() => {
-      socket.destroy();
-      reject(new Error("Timed out waiting for the local NATS client listener"));
-    }, 2_000);
-
-    socket.setEncoding("utf8");
-    socket.on("error", (error) => {
-      clearTimeout(timeout);
-      reject(error);
-    });
-    socket.on("data", (chunk) => {
-      buffer += chunk;
-      if (!pingSent && buffer.includes("INFO")) {
-        socket.write('CONNECT {"verbose":false,"pedantic":false}\r\nPING\r\n');
-        pingSent = true;
-      }
-      if (pingSent && buffer.includes("PONG")) {
-        clearTimeout(timeout);
-        socket.end();
-        resolve();
-      }
-    });
-  });
-}
-
-async function probeTlsListener(host, port) {
-  await new Promise((resolve, reject) => {
-    const socket = tls.connect({
-      host,
-      port,
-      rejectUnauthorized: false,
-      servername: isIpv4Address(host) ? undefined : host,
-    });
-
-    const timeout = setTimeout(() => {
-      socket.destroy();
-      reject(new Error("Timed out waiting for the local WSS listener"));
-    }, 2_000);
-
-    socket.on("secureConnect", () => {
-      clearTimeout(timeout);
-      socket.end();
-      resolve();
-    });
-    socket.on("error", (error) => {
-      clearTimeout(timeout);
-      reject(error);
-    });
-  });
-}
-
-async function probeTcpListener(host, port) {
-  await new Promise((resolve, reject) => {
-    const socket = net.createConnection({ host, port });
-
-    const timeout = setTimeout(() => {
-      socket.destroy();
-      reject(new Error("Timed out waiting for the local WS listener"));
-    }, 2_000);
-
-    socket.once("connect", () => {
-      clearTimeout(timeout);
-      socket.end();
-      resolve();
-    });
-    socket.once("error", (error) => {
-      clearTimeout(timeout);
-      reject(error);
-    });
-  });
-}
-
-async function probeDiscoveryEndpoint(discoveryUrl) {
-  await new Promise((resolve, reject) => {
-    const url = new URL(discoveryUrl);
-    const requestOptions = {
-      hostname: url.hostname,
-      port: url.port,
-      path: url.pathname,
-    };
-    const client = url.protocol === "https:" ? https : http;
-    if (url.protocol === "https:") {
-      requestOptions.rejectUnauthorized = false;
-      requestOptions.servername = isIpv4Address(url.hostname) ? undefined : url.hostname;
-    }
-
-    const request = client.get(
-      requestOptions,
-      (response) => {
-        const chunks = [];
-        response.setEncoding("utf8");
-        response.on("data", chunk => chunks.push(chunk));
-        response.on("end", () => {
-          if (response.statusCode !== 200) {
-            reject(new Error(`Discovery probe returned ${response.statusCode}: ${chunks.join("")}`));
-            return;
-          }
-
-          try {
-            JSON.parse(chunks.join(""));
-            resolve();
-          } catch (error) {
-            reject(error);
-          }
-        });
-      },
-    );
-    request.on("error", reject);
-  });
-}
-
-async function fetchJson(url) {
-  return await new Promise((resolve, reject) => {
-    const parsedUrl = new URL(url);
-    const request = http.get(parsedUrl, (response) => {
-      const chunks = [];
-      response.setEncoding("utf8");
-      response.on("data", chunk => chunks.push(chunk));
-      response.on("end", () => {
-        if (response.statusCode !== 200) {
-          reject(new Error(`HTTP ${response.statusCode} from ${url}`));
-          return;
-        }
-
-        try {
-          resolve(JSON.parse(chunks.join("")));
-        } catch (error) {
-          reject(error);
-        }
-      });
-    });
-    request.on("error", reject);
-  });
 }
 
 function createPeerRecordFromPayload(payload, receivedAt = Date.now()) {
@@ -1836,17 +1496,6 @@ function snapshotState(state) {
   });
 }
 
-function pushOutputLine(state, prefix, content) {
-  for (const rawLine of content.split(/\r?\n/u)) {
-    const line = rawLine.trim();
-    if (!line) continue;
-    state.outputTail.push(`${prefix}${line}`);
-  }
-  if (state.outputTail.length > 50) {
-    state.outputTail.splice(0, state.outputTail.length - 50);
-  }
-}
-
 async function startDiscoveryServer(state, tlsMaterial) {
   const serverFactory = state.webSocketTls ? https.createServer : http.createServer;
   const serverOptions = state.webSocketTls
@@ -1890,6 +1539,7 @@ async function closeServer(server) {
     }
 
     server.close(() => resolve());
+    server.closeAllConnections?.();
   });
 }
 
@@ -1940,24 +1590,6 @@ async function waitForLeafRuntimeReady(state, startupErrorRef) {
   throw new Error(
     `Timed out waiting for the local leaf runtime to become ready${lastProbeError ? `: ${lastProbeError.message}` : ""}`,
   );
-}
-
-async function terminateChildProcess(childProcess) {
-  if (!childProcess || childProcess.exitCode !== null || childProcess.killed) {
-    return;
-  }
-
-  const exitPromise = new Promise((resolve) => {
-    childProcess.once("exit", () => resolve());
-  });
-
-  childProcess.kill("SIGTERM");
-  const timeoutPromise = sleep(5_000).then(() => "timeout");
-  const result = await Promise.race([exitPromise, timeoutPromise]);
-  if (result === "timeout") {
-    childProcess.kill("SIGKILL");
-    await exitPromise;
-  }
 }
 
 export async function startLeafNode(options) {

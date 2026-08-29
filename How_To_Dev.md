@@ -25,6 +25,12 @@ npm install
 
 If you do not want local tests or automation runs to attempt trust-store mutation for the generated leaf CA, set `KINOPIO_SKIP_CA_TRUST_INSTALL=1`.
 
+## Repository Layout
+
+The root `.mjs` files are public facades. Implementation code lives under `lib/`: `lib/shared` contains browser-safe pure utilities, `lib/hub` contains the browser-safe client, and `lib/leaf` contains Node-only leaf runtime code.
+
+Tests live under `test/` and run with `bun test`.
+
 ## Verification
 
 ```bash

@@ -6,6 +6,19 @@ export interface KinopioCodec {
   decode(bytes: Uint8Array): unknown;
 }
 
+export interface KinopioNatsConnection {
+  publish(subject: string, data?: Uint8Array, options?: Record<string, unknown>): void;
+  subscribe(subject: string, options?: Record<string, unknown>): unknown;
+  request(subject: string, data?: Uint8Array, options?: { timeout?: number }): Promise<{ data: Uint8Array }>;
+  flush(): Promise<void>;
+  rtt(): Promise<number>;
+  drain(): Promise<void>;
+  close(): Promise<void>;
+  getServer(): string;
+  isClosed(): boolean;
+  [key: string]: unknown;
+}
+
 export interface KinopioDiscoveryOptions {
   enabled?: boolean;
   manifestUrl?: string;
@@ -29,11 +42,13 @@ export interface KinopioOptions {
   noRandomize?: boolean;
   maxReconnectAttempts?: number;
   waitOnFirstConnect?: boolean;
+  /** @deprecated accepted but ignored */
   reconnectTimeout?: number;
   reconnectTimeWait?: number;
   pingInterval?: number;
   maxPingOut?: number;
   timeout?: number;
+  /** @deprecated accepted but ignored */
   healthReport?: number;
   autoConnect?: boolean;
   autoRetry?: boolean;
@@ -60,6 +75,7 @@ export default class KinopioHub {
   readonly isBrowser: boolean;
   readonly state: KinopioState;
   readonly isConnected: boolean;
+  readonly nats: KinopioNatsConnection | null;
 
   connect(): Promise<void>;
   connected(timeoutMs?: number): Promise<void>;
@@ -77,19 +93,21 @@ export default class KinopioHub {
   offStateChange(listener: (state: KinopioState) => void): void;
 }
 
-export class Scope {
-  constructor(hub: KinopioHub, name: string);
+export interface Scope {
   getVariable<T = unknown>(key: string): Variable<T>;
   dispose(): void;
 }
 
-export class Variable<T = unknown> {
-  value: T | null;
+export interface Variable<T = unknown> {
+  readonly value: T | null;
   readonly subject: string;
 
   pub(data: T, options?: Record<string, unknown>): Promise<void>;
-  sub(callback: (data: T, message: unknown) => unknown | Promise<unknown>, options?: { queue?: string; max?: number }): Promise<Subscription>;
+  sub(callback: (data: T, message: unknown) => unknown | Promise<unknown>, options?: { queue?: string; max?: number; headers?: Record<string, string> }): Promise<Subscription>;
   req<R = unknown>(data: unknown, options?: { timeout?: number }): Promise<R>;
   serve(handler: (request: unknown, message: unknown) => unknown | Promise<unknown>, options?: { queue?: string }): Promise<Subscription>;
   dispose(): void;
 }
+
+export type DynamicHub = KinopioHub & Record<string, Scope>;
+export type DynamicScope = Scope & Record<string, Variable>;

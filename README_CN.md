@@ -81,6 +81,8 @@ await hub.dispose();
 
 根客户端的 `servers` 只接受 `ws://` 或 `wss://` URL。测试或示例里如果希望服务器不可用时快速失败，可以设置 `autoRetry: false`。
 
+`onStateChange` 回调和 `KINOPIO_STATE_EVENT` 通知现在按 hub 实例隔离。这修复了 2.1.x 及更早版本中意外使用进程全局状态的行为。
+
 ### 作用域
 
 作用域是你显式管理的 subject 前缀，变量会再追加一个 subject 段。
@@ -113,6 +115,8 @@ sub.unsubscribe();
 ```
 
 每个变量会跟踪本地看到的最新值。同一个变量连续发布完全相同的字节内容时会去重。
+
+在同一个变量上多次调用 `sub()` 时，每个订阅都会独立收到每一条消息。每个返回的 handle 只取消自己的回调；最后一个 handle 取消订阅后，底层 NATS subscription 才会释放。
 
 ### 请求/响应
 
@@ -150,7 +154,7 @@ service.unsubscribe();
 | `codec` | `{ encode, decode }` | `undefined` | 自定义二进制序列化。 |
 | `jsonReplacer` / `jsonReviver` | functions | `undefined` | JSON fallback 的定制入口。 |
 
-如果没有设置 `serverSelectionMode`，旧的 `noRandomize` 仍作为兼容别名保留。新代码优先使用 `serverSelectionMode`。
+如果没有设置 `serverSelectionMode`，旧的 `noRandomize` 兼容别名现在可以再次正常工作。新代码优先使用 `serverSelectionMode`。`reconnectTimeout` 和 `healthReport` 已弃用且不会产生作用：配置仍会被接受，但会被忽略。
 
 ## 服务器选择
 
@@ -220,6 +224,7 @@ Leaf runtime 注意点：
 - 同一个 leaf runtime 内只能使用一种 remote transport：全 `ws://`、全 `wss://`，或全原生 leafnode URL。
 - `webSocketTls` 默认是 `true`。本地开发如果希望暴露 `ws://` 和 `http://` discovery，可以设置为 `false`。
 - TLS 开启且未提供 PEM 文件时，runtime 可以生成本地 CA，并尽力把信任安装到当前机器。CI 或受限环境中可设置 `KINOPIO_SKIP_CA_TRUST_INSTALL=1`。
+- 设置 `KINOPIO_LEAF_DEBUG=1` 可输出详细的 leaf 诊断信息。
 
 ## CLI
 
@@ -265,6 +270,14 @@ done
 npm test
 npm run test:bun
 ```
+
+## 2.2.0
+
+- 修复 `sub()` 的 fan-out，确保每个订阅者都能独立收到每条消息（[issue #2](https://github.com/skyboooox/KinopioHub.JS/issues/2)）。
+- 将状态事件隔离到各个 hub 实例。
+- 移除 `skyboxtool` 依赖。
+- 将内部实现重组到 `lib/`。
+- 加固 leaf 探测和 socket 处理。
 
 ## 许可证
 

@@ -81,6 +81,8 @@ await hub.dispose();
 
 `servers` must be `ws://` or `wss://` URLs for the root client. Use `autoRetry: false` in tests or examples that should fail fast when the server is unavailable.
 
+`onStateChange` callbacks and `KINOPIO_STATE_EVENT` notifications are scoped to each hub instance. This fixes the accidental process-global behavior in versions up to and including 2.1.x.
+
 ### Scopes
 
 Scopes are the first subject segment you manage explicitly. Variables append one more segment.
@@ -113,6 +115,8 @@ sub.unsubscribe();
 ```
 
 Each variable tracks its latest local value. Publishing identical bytes twice in a row from the same variable is deduplicated.
+
+Multiple `sub()` calls on the same variable each receive every message independently. Each returned handle unsubscribes only its own callback, and the underlying NATS subscription is released when the last handle unsubscribes.
 
 ### Request/Reply
 
@@ -150,7 +154,7 @@ service.unsubscribe();
 | `codec` | `{ encode, decode }` | `undefined` | Custom binary serialization. |
 | `jsonReplacer` / `jsonReviver` | functions | `undefined` | JSON fallback customization. |
 
-Legacy `noRandomize` is still accepted when `serverSelectionMode` is not set. Prefer `serverSelectionMode` in new code.
+Legacy `noRandomize` works again as a compatibility alias when `serverSelectionMode` is not set. Prefer `serverSelectionMode` in new code. `reconnectTimeout` and `healthReport` are deprecated no-ops: they remain accepted but are ignored.
 
 ## Server Selection
 
@@ -220,6 +224,7 @@ Leaf runtime notes:
 - Use one remote transport mode per leaf runtime: all `ws://`, all `wss://`, or all native leafnode URLs.
 - `webSocketTls` defaults to `true`. Set it to `false` for local development when you want `ws://` plus `http://` discovery.
 - When TLS is enabled without explicit PEM files, the runtime can generate a local CA and best-effort install trust on the current machine. Set `KINOPIO_SKIP_CA_TRUST_INSTALL=1` in CI or restricted environments.
+- Set `KINOPIO_LEAF_DEBUG=1` for verbose leaf diagnostics.
 
 ## CLI
 
@@ -265,6 +270,14 @@ See [How_To_Dev.md](./How_To_Dev.md).
 npm test
 npm run test:bun
 ```
+
+## 2.2.0
+
+- Fixed `sub()` fan-out so every subscriber receives each message independently ([issue #2](https://github.com/skyboooox/KinopioHub.JS/issues/2)).
+- Scoped state events to each hub instance.
+- Removed the `skyboxtool` dependency.
+- Restructured internals under `lib/`.
+- Hardened leaf probing and socket handling.
 
 ## License
 

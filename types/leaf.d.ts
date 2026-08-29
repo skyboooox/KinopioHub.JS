@@ -109,6 +109,7 @@ export interface LeafNodeHandle {
     tls: LeafTlsStatus;
     [key: string]: unknown;
   }>;
+  __setManifestState?(patch: Partial<LeafDiscoveryManifest>): void;
   stop(): Promise<void>;
 }
 

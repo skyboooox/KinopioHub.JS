@@ -20,6 +20,7 @@
   "files": [
     "bin",
     "example",
+    "lib",
     "kinopio.mjs",
     "leaf.mjs",
     "leaf-election.mjs",
@@ -62,8 +63,7 @@
   },
   "homepage": "https://github.com/skyboooox/KinopioHub.JS#readme",
   "dependencies": {
-    "@nats-io/nats-core": "^3.3.1",
-    "skyboxtool": "^1.0.11"
+    "@nats-io/nats-core": "^3.3.1"
   },
   "devDependencies": {
     "typescript": "^5.9.3"
